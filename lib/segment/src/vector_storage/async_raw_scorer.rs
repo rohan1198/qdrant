@@ -13,6 +13,8 @@ use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{DenseVector, QueryVector, VectorInternal};
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
 use crate::types::Distance;
 use crate::vector_storage::dense::dense_vector_storage::DenseVectorStorageImpl;
 use crate::vector_storage::dense::immutable_dense_vectors::ImmutableDenseVectors;
@@ -135,6 +137,8 @@ where
             Distance::Euclid => self._build_with_metric::<EuclidMetric>(),
             Distance::Dot => self._build_with_metric::<DotProductMetric>(),
             Distance::Manhattan => self._build_with_metric::<ManhattanMetric>(),
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => self._build_with_metric::<PoincareMetric>(),
         }
     }
 

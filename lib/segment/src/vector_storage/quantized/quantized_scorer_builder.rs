@@ -12,6 +12,8 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
 use crate::types::{Distance, QuantizationConfig, VectorStorageDatatype};
 use crate::vector_storage::quantized::quantized_multi_custom_query_scorer::QuantizedMultiCustomQueryScorer;
 use crate::vector_storage::quantized::quantized_multi_query_scorer::QuantizedMultiQueryScorer;
@@ -62,6 +64,8 @@ impl<'a> QuantizedScorerBuilder<'a> {
                 Distance::Manhattan => {
                     self.build_with_metric::<VectorElementType, ManhattanMetric>()
                 }
+                #[cfg(feature = "hyperbolic")]
+                Distance::Poincare => self.build_with_metric::<VectorElementType, PoincareMetric>(),
             },
             VectorStorageDatatype::Uint8 => match self.distance {
                 Distance::Cosine => self.build_with_metric::<VectorElementTypeByte, CosineMetric>(),
@@ -72,6 +76,10 @@ impl<'a> QuantizedScorerBuilder<'a> {
                 Distance::Manhattan => {
                     self.build_with_metric::<VectorElementTypeByte, ManhattanMetric>()
                 }
+                #[cfg(feature = "hyperbolic")]
+                Distance::Poincare => {
+                    self.build_with_metric::<VectorElementTypeByte, PoincareMetric>()
+                }
             },
             VectorStorageDatatype::Float16 => match self.distance {
                 Distance::Cosine => self.build_with_metric::<VectorElementTypeHalf, CosineMetric>(),
@@ -81,6 +89,10 @@ impl<'a> QuantizedScorerBuilder<'a> {
                 }
                 Distance::Manhattan => {
                     self.build_with_metric::<VectorElementTypeHalf, ManhattanMetric>()
+                }
+                #[cfg(feature = "hyperbolic")]
+                Distance::Poincare => {
+                    self.build_with_metric::<VectorElementTypeHalf, PoincareMetric>()
                 }
             },
         }

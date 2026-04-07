@@ -20,6 +20,8 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
 use crate::types::Distance;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query::NaiveFeedbackQuery;
@@ -233,6 +235,12 @@ where
             vector_storage,
             hardware_counter,
         ),
+        #[cfg(feature = "hyperbolic")]
+        Distance::Poincare => new_scorer_with_metric::<TElement, PoincareMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
     }
 }
 
@@ -342,6 +350,12 @@ where
             hardware_counter,
         ),
         Distance::Manhattan => new_multi_scorer_with_metric::<_, ManhattanMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        #[cfg(feature = "hyperbolic")]
+        Distance::Poincare => new_multi_scorer_with_metric::<_, PoincareMetric, _>(
             query,
             vector_storage,
             hardware_counter,

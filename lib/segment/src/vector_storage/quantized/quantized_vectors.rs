@@ -1847,8 +1847,15 @@ impl QuantizedVectors {
                 Distance::Euclid => quantization::DistanceType::L2,
                 Distance::Dot => quantization::DistanceType::Dot,
                 Distance::Manhattan => quantization::DistanceType::L1,
+                #[cfg(feature = "hyperbolic")]
+                Distance::Poincare => quantization::DistanceType::L2,
             },
-            invert: distance == Distance::Euclid || distance == Distance::Manhattan,
+            invert: matches!(distance, Distance::Euclid | Distance::Manhattan) || {
+                #[cfg(feature = "hyperbolic")]
+                { matches!(distance, Distance::Poincare) }
+                #[cfg(not(feature = "hyperbolic"))]
+                { false }
+            },
         }
     }
 
