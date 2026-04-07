@@ -16,6 +16,7 @@ default = []
 testing = ["common/testing", "sparse/testing", "gpu/testing", "quantization/testing"]
 gpu = ["gpu/gpu"]
 rocksdb = ["dep:rocksdb"]
+hyperbolic = []
 
 [build-dependencies]
 cc = { workspace = true }

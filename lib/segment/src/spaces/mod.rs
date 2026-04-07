@@ -13,3 +13,6 @@ pub mod metric_uint;
 
 #[cfg(target_arch = "aarch64")]
 pub mod simple_neon;
+
+#[cfg(feature = "hyperbolic")]
+pub mod hyperbolic;
