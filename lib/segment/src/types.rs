@@ -346,10 +346,7 @@ impl Distance {
             Distance::Dot => DotProductMetric::preprocess(vector),
             Distance::Manhattan => ManhattanMetric::preprocess(vector),
             #[cfg(feature = "hyperbolic")]
-            Distance::Poincare => {
-                use crate::spaces::hyperbolic::poincare_math::{project_to_ball, DEFAULT_CURVATURE};
-                project_to_ball(vector, DEFAULT_CURVATURE)
-            }
+            Distance::Poincare => PoincareMetric::preprocess(vector),
         }
     }
 
@@ -4264,10 +4261,8 @@ mod tests {
             .collect();
 
         sorted_datetimes
-            .windows(2)
-            .for_each(|w| {
-                let (i1, dt1) = &w[0];
-                let (i2, dt2) = &w[1];
+            .array_windows()
+            .for_each(|[(i1, dt1), (i2, dt2)]| {
                 assert!(
                     i1 < i2,
                     "i1: {}, dt1: {}, ts1: {}\ni2: {}, dt2: {}, ts2: {}",

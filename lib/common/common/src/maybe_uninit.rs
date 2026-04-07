@@ -52,10 +52,7 @@ pub const unsafe fn assume_init_mut<T>(this: &mut [MaybeUninit<T>]) -> &mut [T] 
 pub unsafe fn assume_init_vec<T>(this: Vec<MaybeUninit<T>>) -> Vec<T> {
     // SAFETY: caller must guarantee every element was initialized.
     unsafe {
-        let mut this = std::mem::ManuallyDrop::new(this);
-        let ptr = this.as_mut_ptr();
-        let len = this.len();
-        let cap = this.capacity();
+        let (ptr, len, cap) = this.into_raw_parts();
         Vec::from_raw_parts(ptr.cast::<T>(), len, cap)
     }
 }

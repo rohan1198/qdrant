@@ -9,7 +9,7 @@ pub const DEFAULT_CURVATURE: f32 = 1.0;
 
 /// Small epsilon used to avoid division-by-zero and keep points strictly inside
 /// the ball.
-pub const EPS: f32 = 1e-5;
+const EPS: f32 = 1e-5;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
