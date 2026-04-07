@@ -45,6 +45,8 @@ use crate::index::sparse_index::sparse_index_config::SparseIndexConfig;
 use crate::json_path::JsonPath;
 use crate::spaces::metric::{Metric, MetricPostProcessing};
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
 use crate::types::utils::unordered_hash_unique;
 use crate::utils::maybe_arc::MaybeArc;
 
@@ -315,6 +317,8 @@ pub enum Distance {
     Dot,
     // <https://simple.wikipedia.org/wiki/Manhattan_distance>
     Manhattan,
+    #[cfg(feature = "hyperbolic")]
+    Poincare,
 }
 
 impl Distance {
@@ -324,6 +328,8 @@ impl Distance {
             Distance::Euclid => EuclidMetric::postprocess(score),
             Distance::Dot => DotProductMetric::postprocess(score),
             Distance::Manhattan => ManhattanMetric::postprocess(score),
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => PoincareMetric::postprocess(score),
         }
     }
 
@@ -339,6 +345,11 @@ impl Distance {
             Distance::Euclid => EuclidMetric::preprocess(vector),
             Distance::Dot => DotProductMetric::preprocess(vector),
             Distance::Manhattan => ManhattanMetric::preprocess(vector),
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => {
+                // PoincareMetric::preprocess works on f32 DenseVector regardless of T
+                crate::spaces::hyperbolic::poincare_math::project_to_ball(vector, crate::spaces::hyperbolic::poincare_math::DEFAULT_CURVATURE)
+            },
         }
     }
 
@@ -346,6 +357,8 @@ impl Distance {
         match self {
             Distance::Cosine | Distance::Dot => Order::LargeBetter,
             Distance::Euclid | Distance::Manhattan => Order::SmallBetter,
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => Order::SmallBetter,
         }
     }
 

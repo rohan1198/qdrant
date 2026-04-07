@@ -13,6 +13,8 @@ use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{DenseVector, QueryVector, VectorInternal};
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
 use crate::types::Distance;
 use crate::vector_storage::dense::dense_vector_storage::DenseVectorStorageImpl;
 use crate::vector_storage::dense::immutable_dense_vectors::ImmutableDenseVectors;
@@ -21,6 +23,7 @@ use crate::vector_storage::query_scorer::QueryScorer;
 use crate::vector_storage::query_scorer::metric_query_scorer::MetricQueryScorer;
 use crate::vector_storage::{RawScorer, VectorStorage as _};
 
+#[cfg(not(feature = "hyperbolic"))]
 pub fn new<'a, T, Storage>(
     query: QueryVector,
     storage: &'a DenseVectorStorageImpl<T, Storage>,
@@ -33,6 +36,24 @@ where
     EuclidMetric: Metric<T>,
     DotProductMetric: Metric<T>,
     ManhattanMetric: Metric<T>,
+{
+    AsyncRawScorerBuilder::new(query, storage, hardware_counter).build()
+}
+
+#[cfg(feature = "hyperbolic")]
+pub fn new<'a, T, Storage>(
+    query: QueryVector,
+    storage: &'a DenseVectorStorageImpl<T, Storage>,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>>
+where
+    T: PrimitiveVectorElement,
+    Storage: UniversalRead<T>,
+    CosineMetric: Metric<T>,
+    EuclidMetric: Metric<T>,
+    DotProductMetric: Metric<T>,
+    ManhattanMetric: Metric<T>,
+    PoincareMetric: Metric<T>,
 {
     AsyncRawScorerBuilder::new(query, storage, hardware_counter).build()
 }
@@ -123,6 +144,7 @@ where
         }
     }
 
+    #[cfg(not(feature = "hyperbolic"))]
     pub fn build(self) -> OperationResult<Box<dyn RawScorer + 'a>>
     where
         CosineMetric: Metric<T>,
@@ -135,6 +157,24 @@ where
             Distance::Euclid => self._build_with_metric::<EuclidMetric>(),
             Distance::Dot => self._build_with_metric::<DotProductMetric>(),
             Distance::Manhattan => self._build_with_metric::<ManhattanMetric>(),
+        }
+    }
+
+    #[cfg(feature = "hyperbolic")]
+    pub fn build(self) -> OperationResult<Box<dyn RawScorer + 'a>>
+    where
+        CosineMetric: Metric<T>,
+        EuclidMetric: Metric<T>,
+        DotProductMetric: Metric<T>,
+        ManhattanMetric: Metric<T>,
+        PoincareMetric: Metric<T>,
+    {
+        match self.distance {
+            Distance::Cosine => self._build_with_metric::<CosineMetric>(),
+            Distance::Euclid => self._build_with_metric::<EuclidMetric>(),
+            Distance::Dot => self._build_with_metric::<DotProductMetric>(),
+            Distance::Manhattan => self._build_with_metric::<ManhattanMetric>(),
+            Distance::Poincare => self._build_with_metric::<PoincareMetric>(),
         }
     }
 

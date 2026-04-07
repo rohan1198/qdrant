@@ -111,6 +111,11 @@ impl ShaderBuilderParameters for GpuVectorStorage {
             Distance::Manhattan => {
                 defines.insert("MANHATTAN_DISTANCE".to_owned(), None);
             }
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => {
+                // Fall back to Euclid distance shader for GPU. Exact Poincaré distance is CPU-only.
+                defines.insert("EUCLID_DISTANCE".to_owned(), None);
+            }
         }
 
         if let Some(quantization) = &self.quantization {
