@@ -111,7 +111,7 @@ pub fn log_map_origin(p: &[f32], c: f32) -> Vec<f32> {
         return vec![0.0; p.len()];
     }
     let sc_norm = (sc * norm).min(1.0 - EPS); // clamp for atanh domain
-    let coeff = sc_norm.atanh() / (sc * norm);
+    let coeff = (2.0 / sc) * sc_norm.atanh() / norm;
     p.iter().map(|&x| x * coeff).collect()
 }
 

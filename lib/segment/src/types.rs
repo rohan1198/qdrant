@@ -346,7 +346,10 @@ impl Distance {
             Distance::Dot => DotProductMetric::preprocess(vector),
             Distance::Manhattan => ManhattanMetric::preprocess(vector),
             #[cfg(feature = "hyperbolic")]
-            Distance::Poincare => PoincareMetric::preprocess(vector),
+            Distance::Poincare => {
+                // PoincareMetric::preprocess works on f32 DenseVector regardless of T
+                crate::spaces::hyperbolic::poincare_math::project_to_ball(vector, crate::spaces::hyperbolic::poincare_math::DEFAULT_CURVATURE)
+            },
         }
     }
 

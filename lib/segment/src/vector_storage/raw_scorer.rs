@@ -199,6 +199,7 @@ pub fn new_raw_scorer_for_test<'a>(
     new_raw_scorer(vector, vector_storage, HardwareCounterCell::new())
 }
 
+#[cfg(not(feature = "hyperbolic"))]
 pub fn raw_scorer_impl<
     'a,
     TElement: PrimitiveVectorElement,
@@ -235,7 +236,47 @@ where
             vector_storage,
             hardware_counter,
         ),
-        #[cfg(feature = "hyperbolic")]
+    }
+}
+
+#[cfg(feature = "hyperbolic")]
+pub fn raw_scorer_impl<
+    'a,
+    TElement: PrimitiveVectorElement,
+    TVectorStorage: DenseVectorStorage<TElement>,
+>(
+    query: QueryVector,
+    vector_storage: &'a TVectorStorage,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>>
+where
+    CosineMetric: Metric<TElement>,
+    EuclidMetric: Metric<TElement>,
+    DotProductMetric: Metric<TElement>,
+    ManhattanMetric: Metric<TElement>,
+    PoincareMetric: Metric<TElement>,
+{
+    match vector_storage.distance() {
+        Distance::Cosine => new_scorer_with_metric::<TElement, CosineMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Euclid => new_scorer_with_metric::<TElement, EuclidMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Dot => new_scorer_with_metric::<TElement, DotProductMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Manhattan => new_scorer_with_metric::<TElement, ManhattanMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
         Distance::Poincare => new_scorer_with_metric::<TElement, PoincareMetric, _>(
             query,
             vector_storage,
@@ -318,6 +359,7 @@ pub fn raw_scorer_from_query_scorer<'a>(
     Ok(Box::new(RawScorerImpl { query_scorer }))
 }
 
+#[cfg(not(feature = "hyperbolic"))]
 pub fn raw_multi_scorer_impl<
     'a,
     TElement: PrimitiveVectorElement,
@@ -354,7 +396,47 @@ where
             vector_storage,
             hardware_counter,
         ),
-        #[cfg(feature = "hyperbolic")]
+    }
+}
+
+#[cfg(feature = "hyperbolic")]
+pub fn raw_multi_scorer_impl<
+    'a,
+    TElement: PrimitiveVectorElement,
+    TVectorStorage: MultiVectorStorage<TElement>,
+>(
+    query: QueryVector,
+    vector_storage: &'a TVectorStorage,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>>
+where
+    CosineMetric: Metric<TElement>,
+    EuclidMetric: Metric<TElement>,
+    DotProductMetric: Metric<TElement>,
+    ManhattanMetric: Metric<TElement>,
+    PoincareMetric: Metric<TElement>,
+{
+    match vector_storage.distance() {
+        Distance::Cosine => new_multi_scorer_with_metric::<_, CosineMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Euclid => new_multi_scorer_with_metric::<_, EuclidMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Dot => new_multi_scorer_with_metric::<_, DotProductMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
+        Distance::Manhattan => new_multi_scorer_with_metric::<_, ManhattanMetric, _>(
+            query,
+            vector_storage,
+            hardware_counter,
+        ),
         Distance::Poincare => new_multi_scorer_with_metric::<_, PoincareMetric, _>(
             query,
             vector_storage,
