@@ -93,12 +93,12 @@ impl<V: UnsizedValue> ValueHandler for UnsizedHandler<V> {
                 .expect("Size of all values exceeds 4GB");
         }
 
-        let last_offset = offsets.last();
+        // Compute ranges using windows (stable alternative to array_windows)
         let ranges = offsets
-            .array_windows()
-            .map(|[a, b]| a.get() as usize..b.get() as usize)
+            .windows(2)
+            .map(|w| w[0].get() as usize..w[1].get() as usize)
             // the last one is not included in windows, but goes until the end
-            .chain(last_offset.map(|&last| last.get() as usize..current_offset as usize));
+            .chain(offsets.last().map(|&last| last.get() as usize..current_offset as usize));
 
         let mut var_sized_data = vec![0; current_offset as usize];
         for (value, range) in values.iter().zip(ranges) {

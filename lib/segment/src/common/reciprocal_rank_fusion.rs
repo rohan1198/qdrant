@@ -153,8 +153,8 @@ mod tests {
         // assert that the list is sorted
         assert!(
             scored_points
-                .array_windows()
-                .all(|[a, b]| a.score >= b.score),
+                .windows(2)
+                .all(|w| w[0].score >= w[1].score),
         );
 
         assert_eq!(scored_points.len(), 4);

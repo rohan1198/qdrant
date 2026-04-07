@@ -152,7 +152,9 @@ impl<S: UniversalRead<u8>> Pages<S> {
 
         S::read_multi::<P>(self.pages.as_slice(), read_ranges, |idx, _, slice| {
             let offset = buffer_offsets[idx];
-            raw_value[offset..offset + slice.len()].write_copy_of_slice(slice);
+            for (dst, &src) in raw_value[offset..offset + slice.len()].iter_mut().zip(slice.iter()) {
+                dst.write(src);
+            }
             Ok(())
         })?;
 
