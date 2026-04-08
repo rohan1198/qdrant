@@ -3,16 +3,16 @@
 Pipeline:
 1. Load documents from data/wos/documents.jsonl
 2. Embed with pplx-embed-v1 (1024d) on GPU — cached to data/wos/embeddings_1024d.npy
-3. PCA 1024d → 128d, fit on stratified sample — cached to data/wos/embeddings_128d.npy
-4. Project to Poincaré ball at 4 curvature values (0.5, 1.0, 2.0, 5.0)
+3. PCA 1024d -> 128d, fit on stratified sample — cached to data/wos/embeddings_128d.npy
+4. Project to Poincare ball at c=5.0 using 4 projection strategies
 5. Create 5 Qdrant collections and upsert
 
 Collections:
-  wos_cosine  — 128d cosine baseline (standard qdrant_client)
-  wos_c05     — Poincaré c=0.5
-  wos_c10     — Poincaré c=1.0
-  wos_c20     — Poincaré c=2.0
-  wos_c50     — Poincaré c=5.0
+  wos_cosine       — 128d cosine baseline
+  wos_c50_uniform  — Poincare c=5.0, uniform scaling
+  wos_c50_static   — Poincare c=5.0, static per-tier scaling
+  wos_c50_einstein — Poincare c=5.0, Einstein midpoint-derived radii
+  wos_c50_spread   — Poincare c=5.0, Einstein + intra-tier variance
 """
 
 import argparse
@@ -24,6 +24,8 @@ import numpy as np
 import requests
 from sklearn.decomposition import PCA
 from tqdm import tqdm
+
+from projection import STRATEGIES
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -37,37 +39,23 @@ EMBEDDINGS_128_FILE = DATA_DIR / "embeddings_128d.npy"
 MODEL_PATH = Path.home() / "projects" / "pythia" / "models" / "pplx-embed-v1-0.6b"
 
 # ---------------------------------------------------------------------------
-# Poincaré math (from Pythia's poincare.py)
+# Constants
 # ---------------------------------------------------------------------------
-EPS = 1e-5
-BALL_SCALING = 0.9
+CURVATURE = 5.0
+COSINE_COLLECTION = "wos_cosine"
+VECTOR_DIM = 128
 
-
-def exp_map_at_origin(v: np.ndarray, c: float = 1.0) -> np.ndarray:
-    """Map a tangent vector at the origin to the Poincaré ball."""
-    norm_v = np.linalg.norm(v)
-    if norm_v < EPS:
-        return v.copy()
-    sqrt_c = np.sqrt(c)
-    coeff = np.tanh(sqrt_c * norm_v) / (sqrt_c * norm_v)
-    return coeff * v
-
-
-def project_to_ball(x: np.ndarray, c: float = 1.0) -> np.ndarray:
-    """Clip a point to strictly inside the Poincaré ball."""
-    norm = np.linalg.norm(x)
-    if norm < EPS:
-        return x
-    boundary = (1.0 / np.sqrt(c)) - EPS
-    limit = min(0.95, boundary)
-    if norm > limit:
-        return x * (limit / norm)
-    return x
-
+STRATEGY_COLLECTIONS = {
+    "uniform": "wos_c50_uniform",
+    "static": "wos_c50_static",
+    "einstein": "wos_c50_einstein",
+    "einstein_spread": "wos_c50_spread",
+}
 
 # ---------------------------------------------------------------------------
 # Document loading
 # ---------------------------------------------------------------------------
+
 
 def load_documents() -> list[dict]:
     """Load all documents from JSONL file."""
@@ -90,6 +78,7 @@ def load_documents() -> list[dict]:
 # Embedding
 # ---------------------------------------------------------------------------
 
+
 def embed_texts(texts: list[str]) -> np.ndarray:
     """Embed texts with pplx-embed-v1 (1024d). Results cached to disk.
 
@@ -108,7 +97,6 @@ def embed_texts(texts: list[str]) -> np.ndarray:
         )
 
     print(f"Loading model from {MODEL_PATH} ...")
-    # Import here so the script can be syntax-checked without GPU deps installed
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(
@@ -123,7 +111,7 @@ def embed_texts(texts: list[str]) -> np.ndarray:
         batch_size=64,
         show_progress_bar=True,
         convert_to_numpy=True,
-        normalize_embeddings=False,  # keep raw; PCA handles normalization
+        normalize_embeddings=False,
     )
     embeddings = np.array(embeddings, dtype=np.float32)
     print(f"Embeddings shape: {embeddings.shape}")
@@ -143,8 +131,9 @@ def embed_texts(texts: list[str]) -> np.ndarray:
 # PCA reduction
 # ---------------------------------------------------------------------------
 
+
 def reduce_pca(embeddings: np.ndarray, tiers: list[str]) -> np.ndarray:
-    """PCA 1024d → 128d. Fit on stratified sample: all root+mid, 10% leaf.
+    """PCA 1024d -> 128d. Fit on stratified sample: all root+mid, 10% leaf.
 
     Results cached to data/wos/embeddings_128d.npy.
     """
@@ -169,7 +158,6 @@ def reduce_pca(embeddings: np.ndarray, tiers: list[str]) -> np.ndarray:
         elif tier == "leaf":
             leaf_indices.append(i)
 
-    # Add 10% of leaf indices
     k = max(1, int(0.10 * len(leaf_indices)))
     sampled_leaf = random.sample(leaf_indices, k)
     sample_indices.extend(sampled_leaf)
@@ -197,21 +185,9 @@ def reduce_pca(embeddings: np.ndarray, tiers: list[str]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Poincaré projection
-# ---------------------------------------------------------------------------
-
-def project_batch(vectors: np.ndarray, c: float) -> np.ndarray:
-    """Apply exp_map_at_origin + project_to_ball to every row."""
-    out = np.empty_like(vectors)
-    for i in range(len(vectors)):
-        mapped = exp_map_at_origin(vectors[i], c=c)
-        out[i] = project_to_ball(mapped, c=c)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Qdrant collection management
 # ---------------------------------------------------------------------------
+
 
 def create_poincare_collection(
     qdrant_url: str,
@@ -219,15 +195,9 @@ def create_poincare_collection(
     size: int,
     curvature: float,
 ) -> None:
-    """Create a Poincaré collection via REST API.
-
-    Tries to pass curvature inside vectors config; falls back to creating
-    the collection without curvature if the fork does not accept it (will
-    use DEFAULT_CURVATURE=1.0 internally).
-    """
+    """Create a Poincare collection via REST API."""
     url = f"{qdrant_url}/collections/{name}"
 
-    # Delete existing collection if present
     del_resp = requests.delete(url)
     if del_resp.status_code not in (200, 404):
         print(
@@ -244,10 +214,9 @@ def create_poincare_collection(
 
     resp = requests.put(url, json={"vectors": vectors_config})
     if resp.status_code == 200:
-        print(f"  Created collection '{name}' (Poincaré c={curvature})")
+        print(f"  Created collection '{name}' (Poincare c={curvature})")
         return
 
-    # Curvature field may not be accepted yet — retry without it
     print(
         f"  Note: PUT with curvature={curvature} returned {resp.status_code}. "
         f"Retrying without curvature field (fork will use DEFAULT_CURVATURE=1.0). "
@@ -257,7 +226,7 @@ def create_poincare_collection(
     resp2 = requests.put(url, json={"vectors": vectors_config})
     resp2.raise_for_status()
     print(
-        f"  Created collection '{name}' (Poincaré, curvature param unsupported — "
+        f"  Created collection '{name}' (Poincare, curvature param unsupported — "
         f"using server default)"
     )
 
@@ -311,7 +280,6 @@ def upsert_vectors(
                 "domain": doc["domain"],
                 "area": doc["area"],
                 "hierarchy_path": doc["hierarchy_path"],
-                # Omit full text from payload to keep storage light
             }
             points.append(
                 PointStruct(
@@ -329,15 +297,6 @@ def upsert_vectors(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-CURVATURE_COLLECTIONS = [
-    ("wos_c05", 0.5),
-    ("wos_c10", 1.0),
-    ("wos_c20", 2.0),
-    ("wos_c50", 5.0),
-]
-COSINE_COLLECTION = "wos_cosine"
-VECTOR_DIM = 128
 
 
 def main() -> None:
@@ -359,10 +318,31 @@ def main() -> None:
         action="store_true",
         help="Prepare embeddings but do not upsert into Qdrant",
     )
+    parser.add_argument(
+        "--strategy",
+        default="all",
+        help=(
+            "Comma-separated projection strategies to run. "
+            "Options: uniform, static, einstein, einstein_spread, all. "
+            "Default: all"
+        ),
+    )
     args = parser.parse_args()
 
     random.seed(42)
     np.random.seed(42)
+
+    # Parse strategies
+    if args.strategy == "all":
+        strategies_to_run = list(STRATEGIES.keys())
+    else:
+        strategies_to_run = [s.strip() for s in args.strategy.split(",")]
+        for s in strategies_to_run:
+            if s not in STRATEGIES:
+                parser.error(
+                    f"Unknown strategy '{s}'. "
+                    f"Choose from: {', '.join(STRATEGIES.keys())}, all"
+                )
 
     # ------------------------------------------------------------------
     # Step 1: Load documents
@@ -372,7 +352,7 @@ def main() -> None:
     texts = [d["text"] for d in docs]
     tiers = [d["tier"] for d in docs]
 
-    tier_counts = {}
+    tier_counts: dict[str, int] = {}
     for t in tiers:
         tier_counts[t] = tier_counts.get(t, 0) + 1
     print(f"Tier breakdown: {tier_counts}")
@@ -388,9 +368,9 @@ def main() -> None:
         embeddings_1024 = embed_texts(texts)
 
     # ------------------------------------------------------------------
-    # Step 3: PCA 1024d → 128d
+    # Step 3: PCA 1024d -> 128d
     # ------------------------------------------------------------------
-    print("\n=== Step 3: PCA reduction (1024d → 128d) ===")
+    print("\n=== Step 3: PCA reduction (1024d -> 128d) ===")
     if args.skip_embed and EMBEDDINGS_128_FILE.exists():
         print(f"--skip-embed: loading from {EMBEDDINGS_128_FILE}")
         embeddings_128 = np.load(EMBEDDINGS_128_FILE)
@@ -413,36 +393,56 @@ def main() -> None:
     client = QdrantClient(url=qdrant_url)
 
     # Cosine baseline
-    print(f"Creating cosine baseline collection ...")
+    print("Creating cosine baseline collection ...")
     create_cosine_collection(client, COSINE_COLLECTION, size=VECTOR_DIM)
 
-    # Poincaré collections
-    for coll_name, c in CURVATURE_COLLECTIONS:
-        print(f"Creating Poincaré collection c={c} ...")
-        create_poincare_collection(qdrant_url, coll_name, size=VECTOR_DIM, curvature=c)
-
-    print("\n=== Step 5: Upsert vectors ===")
+    print("\n=== Step 5: Project and upsert (c={}, strategies={}) ===".format(
+        CURVATURE, strategies_to_run
+    ))
 
     # Cosine: use PCA-reduced vectors directly
     print("Upserting cosine collection ...")
     upsert_vectors(client, COSINE_COLLECTION, docs, embeddings_128)
 
-    # Poincaré: project before upserting
-    for coll_name, c in CURVATURE_COLLECTIONS:
-        print(f"Projecting to Poincaré ball (c={c}) ...")
-        poincare_vecs = project_batch(embeddings_128, c=c)
-        norm_stats = np.linalg.norm(poincare_vecs, axis=1)
-        print(
-            f"  Norm stats — min: {norm_stats.min():.4f}, "
-            f"max: {norm_stats.max():.4f}, mean: {norm_stats.mean():.4f}"
+    # Poincare: project with each strategy, then upsert
+    for strategy_name in strategies_to_run:
+        coll_name = STRATEGY_COLLECTIONS[strategy_name]
+        print(f"\nProjecting with strategy '{strategy_name}' (c={CURVATURE}) ...")
+
+        create_poincare_collection(
+            qdrant_url, coll_name, size=VECTOR_DIM, curvature=CURVATURE
         )
-        upsert_vectors(client, coll_name, docs, poincare_vecs)
+
+        strategy_fn = STRATEGIES[strategy_name]
+        result = strategy_fn(embeddings_128, tiers, c=CURVATURE)
+        projected = result["vectors"]
+        metadata = result["metadata"]
+
+        norm_stats = metadata.get("norm_stats", {})
+        print(
+            f"  Norm stats — min: {norm_stats.get('min', 0):.4f}, "
+            f"max: {norm_stats.get('max', 0):.4f}, "
+            f"mean: {norm_stats.get('mean', 0):.4f}"
+        )
+
+        if "tier_radii" in metadata:
+            print(f"  Derived tier radii: {metadata['tier_radii']}")
+
+        if "tier_norm_stats" in metadata:
+            for tier, stats in metadata["tier_norm_stats"].items():
+                print(
+                    f"  {tier:>5}: norm mean={stats['mean']:.4f}, "
+                    f"std={stats['std']:.4f}"
+                )
+
+        upsert_vectors(client, coll_name, docs, projected)
 
     print("\nAll done.")
     print("Collections created and populated:")
-    print(f"  {COSINE_COLLECTION}  — 128d cosine baseline")
-    for coll_name, c in CURVATURE_COLLECTIONS:
-        print(f"  {coll_name:<12} — Poincaré c={c}")
+    print(f"  {COSINE_COLLECTION:<20} — 128d cosine baseline")
+    for strategy_name in strategies_to_run:
+        coll_name = STRATEGY_COLLECTIONS[strategy_name]
+        print(f"  {coll_name:<20} — Poincare c={CURVATURE} ({strategy_name})")
 
 
 if __name__ == "__main__":
