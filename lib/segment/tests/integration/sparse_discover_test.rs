@@ -146,6 +146,8 @@ fn sparse_index_discover_test() {
                 quantization_config: None,
                 multivector_config: None,
                 datatype: None,
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         )]),
         payload_storage_type: Default::default(),

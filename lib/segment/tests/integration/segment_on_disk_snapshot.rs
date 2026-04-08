@@ -124,6 +124,8 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
                 quantization_config: None,
                 multivector_config: None,
                 datatype: None,
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         )]),
         sparse_vector_data: Default::default(),

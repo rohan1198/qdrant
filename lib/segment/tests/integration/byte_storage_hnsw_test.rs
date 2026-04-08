@@ -90,6 +90,8 @@ fn test_byte_storage_hnsw(
                 quantization_config: None,
                 multivector_config: None,
                 datatype: Some(storage_data_type),
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         )]),
         sparse_vector_data: Default::default(),

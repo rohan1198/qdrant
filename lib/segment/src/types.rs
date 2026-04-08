@@ -1666,6 +1666,12 @@ pub struct VectorDataConfig {
     /// Vector specific configuration to set specific storage element type
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datatype: Option<VectorStorageDatatype>,
+    /// Poincaré ball curvature for hyperbolic distance. Only used when
+    /// distance is `Poincare`. Defaults to 1.0 if not specified.
+    #[cfg(feature = "hyperbolic")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub curvature: Option<f32>,
 }
 
 impl VectorDataConfig {
@@ -1687,6 +1693,15 @@ impl VectorDataConfig {
         is_index_appendable && is_storage_appendable
     }
 
+    /// Get the Poincaré curvature for this vector config.
+    /// Returns `DEFAULT_CURVATURE` (1.0) if not set or if the feature is disabled.
+    #[cfg(feature = "hyperbolic")]
+    pub fn curvature(&self) -> f32 {
+        self.curvature.unwrap_or(
+            crate::spaces::hyperbolic::poincare_math::DEFAULT_CURVATURE
+        )
+    }
+
     pub fn check_compatible(&self, other: &Self) -> Result<(), String> {
         // Size and distance have to be the same for both segments.
         // Storage type, index and quantization config can be different.
@@ -1700,6 +1715,8 @@ impl VectorDataConfig {
             quantization_config: _,
             multivector_config,
             datatype,
+            #[cfg(feature = "hyperbolic")]
+            curvature: _,
         } = self;
 
         if *size != other.size {

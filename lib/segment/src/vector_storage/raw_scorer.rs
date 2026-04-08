@@ -21,7 +21,9 @@ use crate::data_types::vectors::{
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
 #[cfg(feature = "hyperbolic")]
-use crate::spaces::hyperbolic::poincare_metric::PoincareMetric;
+use crate::data_types::vectors::VectorElementType;
+#[cfg(feature = "hyperbolic")]
+use crate::spaces::hyperbolic::poincare_metric::{PoincareCurvatureQueryScorer, PoincareMetric};
 use crate::types::Distance;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query::NaiveFeedbackQuery;
@@ -107,6 +109,77 @@ pub fn new_raw_scorer<'a>(
         }
         VectorStorageEnum::MultiDenseAppendableMemmapHalf(vs) => {
             raw_multi_scorer_impl(query, vs.as_ref(), hc)
+        }
+    }
+}
+
+/// Create a raw scorer with explicit Poincaré curvature.
+///
+/// Call sites that have access to `VectorDataConfig` should use this
+/// instead of `new_raw_scorer` when the distance is `Poincare` to get
+/// curvature-aware scoring. Falls back to `new_raw_scorer` for
+/// non-f32 storage and non-Nearest queries.
+#[cfg(feature = "hyperbolic")]
+pub fn new_raw_scorer_with_curvature<'a>(
+    query: QueryVector,
+    vector_storage: &'a VectorStorageEnum,
+    hc: HardwareCounterCell,
+    curvature: f32,
+) -> OperationResult<Box<dyn RawScorer + 'a>> {
+    use crate::vector_storage::vector_storage_base::VectorStorage as _;
+
+    // Only intercept f32 Dense storage with Nearest queries for Poincare.
+    // All other cases delegate to the standard path.
+    if vector_storage.distance() == Distance::Poincare {
+        if let QueryVector::Nearest(ref _vector) = query {
+            return match vector_storage {
+                #[cfg(feature = "rocksdb")]
+                VectorStorageEnum::DenseSimple(vs) => {
+                    new_poincare_curvature_scorer(query, vs, curvature, hc)
+                }
+                VectorStorageEnum::DenseVolatile(vs) => {
+                    new_poincare_curvature_scorer(query, vs, curvature, hc)
+                }
+                VectorStorageEnum::DenseMemmap(vs) => {
+                    new_poincare_curvature_scorer(query, vs.as_ref(), curvature, hc)
+                }
+                VectorStorageEnum::DenseAppendableMemmap(vs) => {
+                    new_poincare_curvature_scorer(query, vs.as_ref(), curvature, hc)
+                }
+                // Non-f32 variants: fall through to default path
+                _ => new_raw_scorer(query, vector_storage, hc),
+            };
+        }
+    }
+    // Non-Poincare or non-Nearest: use default path
+    new_raw_scorer(query, vector_storage, hc)
+}
+
+#[cfg(feature = "hyperbolic")]
+fn new_poincare_curvature_scorer<'a, TVectorStorage: DenseVectorStorage<VectorElementType>>(
+    query: QueryVector,
+    vector_storage: &'a TVectorStorage,
+    curvature: f32,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>> {
+    match query {
+        QueryVector::Nearest(vector) => {
+            let dense: DenseVector = vector.try_into()?;
+            let query_scorer = PoincareCurvatureQueryScorer::new(
+                dense,
+                curvature,
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        // Non-Nearest query: fall back to PoincareMetric with DEFAULT_CURVATURE
+        other => {
+            new_scorer_with_metric::<VectorElementType, PoincareMetric, _>(
+                other,
+                vector_storage,
+                hardware_counter,
+            )
         }
     }
 }

@@ -777,6 +777,8 @@ fn create_deferred_segment(
                     quantization_config: None,
                     multivector_config: None,
                     datatype: None,
+                    #[cfg(feature = "hyperbolic")]
+                    curvature: None,
                 },
             )]),
             sparse_vector_data: HashMap::from_iter([
