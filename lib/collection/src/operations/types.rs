@@ -1770,6 +1770,8 @@ impl From<&segment::types::VectorDataConfig> for VectorParamsBase {
             quantization_config: _,
             multivector_config: _,
             datatype: _,
+            #[cfg(feature = "hyperbolic")]
+            curvature: _,
         } = config;
         Self { size, distance }
     }

@@ -83,6 +83,8 @@ impl SegmentOptimizerConfig {
                     ),
                     multivector_config,
                     datatype,
+                    #[cfg(feature = "hyperbolic")]
+                    curvature: None,
                 },
             );
             dense_vector.insert(
