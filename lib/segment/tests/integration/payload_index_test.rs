@@ -270,6 +270,8 @@ impl TestSegments {
                     quantization_config: None,
                     multivector_config: None,
                     datatype: None,
+                    #[cfg(feature = "hyperbolic")]
+                    curvature: None,
                 },
             )]),
             sparse_vector_data: Default::default(),

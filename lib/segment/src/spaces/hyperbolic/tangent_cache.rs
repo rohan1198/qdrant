@@ -6,7 +6,7 @@
 /// At query time we map the query the same way and use cheap Euclidean distance
 /// to produce a shortlist, then re-rank the shortlist with exact Poincaré
 /// distance.
-use super::poincare_math::{frechet_mean, log_map, poincare_distance};
+use super::poincare_math::{einstein_midpoint, log_map, poincare_distance};
 
 pub struct TangentCache {
     centroid: Vec<f32>,
@@ -29,9 +29,9 @@ impl TangentCache {
             };
         }
 
-        // Collect &[f32] slices for frechet_mean
+        // Collect &[f32] slices for einstein_midpoint
         let slices: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
-        let centroid = frechet_mean(&slices, curvature);
+        let centroid = einstein_midpoint(&slices, curvature);
 
         // Pre-compute log-map from centroid to every point
         let tangent_coords: Vec<Vec<f32>> = vectors

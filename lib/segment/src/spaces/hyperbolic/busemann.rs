@@ -1,35 +1,4 @@
-use super::poincare_math::frechet_mean;
-
-const EPS: f32 = 1e-5;
-
-/// Convert a Poincare ball point to the Lorentz hyperboloid model.
-///
-/// Lorentz coordinates: x_0 = (1 + c||x||^2) / (1 - c||x||^2)
-///                      x_i = 2*sqrt(c)*x_i / (1 - c||x||^2)  for i > 0
-///
-/// Returns a vector of dimension d+1 (prepends the time component x_0).
-pub fn poincare_to_lorentz(p: &[f32], c: f32) -> Vec<f32> {
-    let norm_sq: f32 = p.iter().map(|v| v * v).sum();
-    let denom = (1.0 - c * norm_sq).max(EPS);
-    let x0 = (1.0 + c * norm_sq) / denom;
-    let sqrt_c = c.sqrt();
-    let mut result = Vec::with_capacity(p.len() + 1);
-    result.push(x0);
-    for &xi in p {
-        result.push(2.0 * sqrt_c * xi / denom);
-    }
-    result
-}
-
-/// Lorentz inner product: <x, y>_L = -x_0*y_0 + x_1*y_1 + ... + x_n*y_n
-#[inline]
-pub fn lorentz_inner(x: &[f32], y: &[f32]) -> f32 {
-    let mut result = -x[0] * y[0];
-    for i in 1..x.len() {
-        result += x[i] * y[i];
-    }
-    result
-}
+use super::poincare_math::{einstein_midpoint, lorentz_inner, poincare_to_lorentz, EPS};
 
 /// Compute focal direction from a set of Poincare ball points.
 ///
@@ -40,7 +9,7 @@ pub fn compute_focal_direction(points: &[&[f32]], c: f32) -> Vec<f32> {
     if points.is_empty() {
         return vec![];
     }
-    let mean = frechet_mean(points, c);
+    let mean = einstein_midpoint(points, c);
     let lorentz_mean = poincare_to_lorentz(&mean, c);
     // Project onto null cone: normalize so that <xi, xi>_L = 0
     // For a light-like vector: x_0 = ||x_spatial||

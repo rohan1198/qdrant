@@ -73,6 +73,8 @@ fn test_multi_filterable_hnsw(
                 quantization_config: None,
                 multivector_config: Some(MultiVectorConfig::default()), // uses multivec config
                 datatype: None,
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         )]),
         sparse_vector_data: Default::default(),

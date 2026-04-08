@@ -142,6 +142,8 @@ pub fn build_segment_3(path: &Path) -> Segment {
                         quantization_config: None,
                         multivector_config: None,
                         datatype: None,
+                        #[cfg(feature = "hyperbolic")]
+                        curvature: None,
                     },
                 ),
                 (
@@ -154,6 +156,8 @@ pub fn build_segment_3(path: &Path) -> Segment {
                         quantization_config: None,
                         multivector_config: None,
                         datatype: None,
+                        #[cfg(feature = "hyperbolic")]
+                        curvature: None,
                     },
                 ),
                 (
@@ -166,6 +170,8 @@ pub fn build_segment_3(path: &Path) -> Segment {
                         quantization_config: None,
                         multivector_config: None,
                         datatype: None,
+                        #[cfg(feature = "hyperbolic")]
+                        curvature: None,
                     },
                 ),
             ]),

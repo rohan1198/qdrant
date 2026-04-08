@@ -321,6 +321,8 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
                 quantization_config: None,
                 multivector_config: None,
                 datatype: None,
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         )]),
         sparse_vector_data: Default::default(),
