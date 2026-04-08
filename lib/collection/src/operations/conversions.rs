@@ -1412,6 +1412,8 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
                 Distance::Euclid => api::grpc::qdrant::Distance::Euclid,
                 Distance::Dot => api::grpc::qdrant::Distance::Dot,
                 Distance::Manhattan => api::grpc::qdrant::Distance::Manhattan,
+                #[cfg(feature = "hyperbolic")]
+                Distance::Poincare => panic!("Poincare distance not supported via gRPC yet"),
             }
             .into(),
             hnsw_config: hnsw_config.map(Into::into),

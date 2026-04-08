@@ -15,6 +15,7 @@ workspace = true
 default = ["api"]
 testing = []
 staging = []
+hyperbolic = ["segment/hyperbolic"]
 
 [dependencies]
 api = { path = "../api", optional = true }
