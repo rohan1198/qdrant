@@ -618,6 +618,69 @@ def upsert_unified(
     print(f"  Upserted {total_pts} total points into '{collection_name}'")
 
 
+def create_sweep_collection(
+    client,
+    qdrant_url: str,
+    embeddings_128: np.ndarray,
+    docs: list[dict],
+    tiers: list[str],
+    curvature: float,
+) -> str:
+    """Create a temporary unified collection at a specific curvature.
+
+    Returns the collection name.
+    """
+    c_str = str(curvature).replace(".", "")
+    coll_name = f"wos_unified_c{c_str}"
+
+    print(f"  Projecting with einstein_spread at c={curvature} ...")
+    strategy_fn = STRATEGIES["einstein_spread"]
+    result = strategy_fn(embeddings_128, tiers, c=curvature)
+    poincare_vectors = result["vectors"]
+
+    print(f"  Computing Busemann depths at c={curvature} ...")
+    vectors_list = [poincare_vectors[i] for i in range(len(poincare_vectors))]
+    focal = compute_focal_direction(vectors_list, c=curvature)
+    depths = np.array([
+        busemann_depth_single(poincare_vectors[i], focal, c=curvature)
+        for i in range(len(poincare_vectors))
+    ], dtype=np.float32)
+
+    print(f"  Generating tier centroids at c={curvature} ...")
+    area_entries, domain_entries = generate_tier_centroids(
+        docs, embeddings_128, poincare_vectors, depths, focal, c=curvature,
+    )
+
+    print(f"  Creating collection '{coll_name}' ...")
+    create_unified_collection(qdrant_url, coll_name, size=VECTOR_DIM, curvature=curvature)
+    upsert_unified(
+        client, coll_name, docs, embeddings_128, poincare_vectors, depths,
+        area_entries, domain_entries,
+    )
+
+    # Payload indices
+    client.create_payload_index(
+        collection_name=coll_name,
+        field_name="busemann_depth",
+        field_schema="float",
+    )
+    client.create_payload_index(
+        collection_name=coll_name,
+        field_name="tier",
+        field_schema="keyword",
+    )
+
+    # Print depth summary
+    area_depths = [e["busemann_depth"] for e in area_entries]
+    domain_depths = [e["busemann_depth"] for e in domain_entries]
+    print(f"  Depths at c={curvature}:")
+    print(f"    Narratives: mean={np.mean(domain_depths):.4f}")
+    print(f"    Stories:    mean={np.mean(area_depths):.4f}")
+    print(f"    Content:    mean={depths.mean():.4f}")
+
+    return coll_name
+
+
 def cleanup_legacy_collections(client, qdrant_url: str) -> None:
     """Delete legacy per-strategy collections to free space."""
     import requests
@@ -673,6 +736,11 @@ def main() -> None:
         "--cleanup-legacy",
         action="store_true",
         help="Delete legacy per-strategy collections to free space",
+    )
+    parser.add_argument(
+        "--curvature-sweep",
+        action="store_true",
+        help="Run curvature sweep: create temporary unified collections at c=1,2,5,10",
     )
     args = parser.parse_args()
 
@@ -816,6 +884,22 @@ def main() -> None:
             strat_fn = STRATEGIES[strategy_name]
             strat_result = strat_fn(embeddings_128, tiers, c=CURVATURE)
             upsert_vectors(client, coll_name, docs, strat_result["vectors"])
+
+    # ------------------------------------------------------------------
+    # Optional: Curvature re-sweep
+    # ------------------------------------------------------------------
+    if args.curvature_sweep:
+        print(f"\n=== Curvature Re-sweep ===")
+        sweep_curvatures = [1.0, 2.0, 5.0, 10.0]
+        sweep_names = []
+        for c in sweep_curvatures:
+            print(f"\n--- Curvature c={c} ---")
+            name = create_sweep_collection(
+                client, qdrant_url, embeddings_128, docs, tiers, c,
+            )
+            sweep_names.append(name)
+        print(f"\nSweep collections created: {sweep_names}")
+        print("Run benchmark.py to compare all collections.")
 
     print("\nAll done.")
 
