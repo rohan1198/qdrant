@@ -117,6 +117,14 @@ def compute_busemann_depths(
     return [busemann_score(lv, focal) for lv in lorentz_vecs]
 
 
+def busemann_depth_single(
+    vector: np.ndarray, focal: np.ndarray, c: float = 1.0
+) -> float:
+    """Busemann depth for a single Poincare ball vector given a focal direction."""
+    lorentz = poincare_to_lorentz(vector, c)
+    return busemann_score(lorentz, focal)
+
+
 # ---------------------------------------------------------------------------
 # Einstein midpoint
 # ---------------------------------------------------------------------------

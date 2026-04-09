@@ -28,8 +28,8 @@ case "${1:-all}" in
         echo "=== Downloading dataset ==="
         python3 download_dataset.py
 
-        echo "=== Embedding & uploading ==="
-        python3 embed.py --qdrant-url "$QDRANT_URL"
+        echo "=== Embedding & uploading (unified) ==="
+        python3 embed.py --qdrant-url "$QDRANT_URL" --cleanup-legacy
 
         echo "=== Running benchmarks ==="
         python3 benchmark.py --qdrant-url "$QDRANT_URL"
@@ -41,16 +41,22 @@ case "${1:-all}" in
         ;;
     embed)
         wait_for_qdrant
-        echo "=== Embedding & uploading ==="
-        python3 embed.py --qdrant-url "$QDRANT_URL"
+        echo "=== Embedding & uploading (unified) ==="
+        python3 embed.py --qdrant-url "$QDRANT_URL" --cleanup-legacy
         echo "=== Running benchmarks ==="
         python3 benchmark.py --qdrant-url "$QDRANT_URL"
+        ;;
+    rebuild)
+        echo "=== Rebuilding Qdrant binary ==="
+        docker compose up -d --build
+        wait_for_qdrant
+        echo "Qdrant rebuilt and ready."
         ;;
     down)
         docker compose down -v
         ;;
     *)
-        echo "Usage: ./run.sh [all|benchmark|embed|down]"
+        echo "Usage: ./run.sh [all|benchmark|embed|rebuild|down]"
         exit 1
         ;;
 esac

@@ -301,7 +301,7 @@ pub fn einstein_midpoint(points: &[&[f32]], c: f32) -> Vec<f32> {
 
     // Project onto hyperboloid and convert back to Poincaré
     let on_hyperboloid = project_hyperboloid(&weighted_sum, c);
-    let poincare = lorentz_to_poincare(&on_hyperboloid);
+    let poincare = lorentz_to_poincare(&on_hyperboloid, c);
     project_to_ball(poincare, c)
 }
 
@@ -352,10 +352,14 @@ pub fn project_hyperboloid(x: &[f32], c: f32) -> Vec<f32> {
 
 /// Convert a Lorentz hyperboloid point back to Poincaré ball coordinates.
 ///
-/// p_i = x_i / (x_0 + 1)  for i > 0
-pub fn lorentz_to_poincare(x: &[f32]) -> Vec<f32> {
+/// p_i = x_i / (√c · (x_0 + 1))  for i > 0
+///
+/// The forward map `poincare_to_lorentz` scales spatial components by 2√c,
+/// so the inverse must divide by √c to recover the original Poincaré point.
+pub fn lorentz_to_poincare(x: &[f32], c: f32) -> Vec<f32> {
     let x0 = x[0];
-    let denom = x0 + 1.0;
+    let sqrt_c = c.sqrt();
+    let denom = sqrt_c * (x0 + 1.0);
     x[1..].iter().map(|&xi| xi / denom.max(EPS)).collect()
 }
 
@@ -829,5 +833,21 @@ mod tests {
             sep_c2 > sep_c1 * 0.8,
             "higher curvature should maintain/increase separation: c1={sep_c1:.3}, c2={sep_c2:.3}"
         );
+    }
+
+    #[test]
+    fn test_lorentz_roundtrip_nonunit_curvature() {
+        // Round-trip: lorentz_to_poincare(poincare_to_lorentz(p, c), c) ≈ p
+        // Point must lie inside the Poincaré ball: ||p|| < 1/√c.
+        // For c=10, the ball radius is ~0.316, so we use a small point.
+        let p = vec![0.05f32, -0.07, 0.03];
+        for &c in &[1.0, 2.0, 5.0, 10.0] {
+            let lorentz = poincare_to_lorentz(&p, c);
+            let recovered = lorentz_to_poincare(&lorentz, c);
+            assert!(
+                vec_approx_eq(&recovered, &p),
+                "round-trip failed at c={c}: p={p:?}, recovered={recovered:?}"
+            );
+        }
     }
 }
