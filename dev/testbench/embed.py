@@ -180,7 +180,7 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     print(f"Embedding {len(texts)} texts on GPU ...")
     embeddings = model.encode(
         texts,
-        batch_size=64,
+        batch_size=32,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=False,
@@ -224,10 +224,14 @@ def reduce_pca(embeddings: np.ndarray, tiers: list[str]) -> np.ndarray:
     sample_indices = []
     leaf_indices = []
 
+    # Content/leaf tiers are the bulk; all other tiers are non-leaf (centroids)
+    content_tiers = {"leaf", "content"}
+    non_content_tiers = {"root", "mid", "narrative", "story", "sub_story", "sub_narrative", "theme"}
+
     for i, tier in enumerate(tiers):
-        if tier in ("root", "mid"):
+        if tier in non_content_tiers:
             sample_indices.append(i)
-        elif tier == "leaf":
+        elif tier in content_tiers:
             leaf_indices.append(i)
 
     k = max(1, int(0.10 * len(leaf_indices)))
@@ -859,8 +863,23 @@ def main() -> None:
     # Step 4: Project to Poincare (einstein_spread)
     # ------------------------------------------------------------------
     print(f"\n=== Step 4: Project to Poincare ball (c={CURVATURE}, einstein_spread) ===")
+
+    # Normalize tier names to root/mid/leaf for projection functions
+    # (projection.py expects exactly these three tier names)
+    content_names = {"leaf", "content"}
+    root_names = {"root", "narrative", "theme"}
+    # Everything else maps to "mid"
+    projection_tiers = []
+    for t in tiers:
+        if t in content_names:
+            projection_tiers.append("leaf")
+        elif t in root_names:
+            projection_tiers.append("root")
+        else:
+            projection_tiers.append("mid")
+
     strategy_fn = STRATEGIES["einstein_spread"]
-    result = strategy_fn(embeddings_128, tiers, c=CURVATURE)
+    result = strategy_fn(embeddings_128, projection_tiers, c=CURVATURE)
     poincare_vectors = result["vectors"]
     metadata = result["metadata"]
 

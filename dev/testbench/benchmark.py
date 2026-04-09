@@ -1015,16 +1015,24 @@ def main() -> None:
     results_dir.mkdir(exist_ok=True)
     output_path = results_dir / f"benchmark_{timestamp}.json"
 
-    # Find unified + cosine collection pairs (works for any prefix: wos, bgc, scihtc)
-    unified_name = None
-    cosine_name = None
+    # Find unified + cosine collection pairs grouped by prefix (wos, bgc, scihtc)
+    # Each prefix can have at most one unified and one cosine collection
+    dataset_pairs: list[tuple[str, str]] = []  # (unified_name, cosine_name)
+    prefix_unified: dict[str, str] = {}
+    prefix_cosine: dict[str, str] = {}
     for c in collection_configs:
-        if c.get("strategy") == "unified" and "_c" not in c["name"].replace("_cosine", ""):
-            unified_name = c["name"]
-        if c.get("strategy") is None and c["name"].endswith("_cosine"):
-            cosine_name = c["name"]
-    has_unified = unified_name is not None
-    has_cosine = cosine_name is not None
+        # Extract prefix from name (e.g., "wos" from "wos_unified")
+        name = c["name"]
+        for pfx in ["wos", "bgc", "scihtc"]:
+            if name.startswith(pfx + "_"):
+                if c.get("strategy") == "unified" and "_c" not in name.replace(pfx + "_unified", ""):
+                    prefix_unified[pfx] = name
+                if c.get("strategy") is None and name == pfx + "_cosine":
+                    prefix_cosine[pfx] = name
+                break
+
+    for pfx in sorted(set(prefix_unified) & set(prefix_cosine)):
+        dataset_pairs.append((prefix_unified[pfx], prefix_cosine[pfx]))
 
     # --- Standard per-collection benchmarks ---
     for col_cfg in collection_configs:
@@ -1088,9 +1096,9 @@ def main() -> None:
 
         all_results[collection] = col_results
 
-    # --- Unified-specific benchmarks ---
-    if has_unified and has_cosine:
-        print(f"\n  Using unified={unified_name}, cosine={cosine_name}")
+    # --- Unified-specific benchmarks (per dataset pair) ---
+    for unified_name, cosine_name in dataset_pairs:
+        print(f"\n  === Dataset pair: unified={unified_name}, cosine={cosine_name} ===")
 
         # --- Benchmark 3: Cross-Tier Retrieval ---
         if args.suite in ("all", "cross-tier"):
