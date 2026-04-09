@@ -33,21 +33,72 @@ from hyperbolic_math import (
 )
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths & Dataset Configuration
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
+MODEL_PATH = Path.home() / "projects" / "pythia" / "models" / "pplx-embed-v1-0.6b"
+
+# Defaults (overridden by --dataset flag in main())
 DATA_DIR = SCRIPT_DIR / "data" / "wos"
 DOCUMENTS_FILE = DATA_DIR / "documents.jsonl"
 EMBEDDINGS_1024_FILE = DATA_DIR / "embeddings_1024d.npy"
 EMBEDDINGS_128_FILE = DATA_DIR / "embeddings_128d.npy"
+FOCAL_DIRECTION_FILE = DATA_DIR / "focal_direction.npy"
+BUSEMANN_DEPTHS_FILE = DATA_DIR / "busemann_depths.npy"
 
-MODEL_PATH = Path.home() / "projects" / "pythia" / "models" / "pplx-embed-v1-0.6b"
+DATASET_CONFIGS = {
+    "wos": {
+        "data_dir": SCRIPT_DIR / "data" / "wos",
+        "documents": SCRIPT_DIR / "data" / "wos" / "documents.jsonl",
+        "source_dir": None,  # downloaded by download_dataset.py in testbench
+    },
+    "bgc": {
+        "data_dir": SCRIPT_DIR / "data" / "bgc",
+        "documents": SCRIPT_DIR / "data" / "bgc" / "documents.jsonl",
+        "source_dir": SCRIPT_DIR.parent / "datasets" / "bgc" / "data",
+    },
+    "scihtc": {
+        "data_dir": SCRIPT_DIR / "data" / "scihtc",
+        "documents": SCRIPT_DIR / "data" / "scihtc" / "documents.jsonl",
+        "source_dir": SCRIPT_DIR.parent / "datasets" / "scihtc" / "data",
+    },
+}
+
+
+def _apply_dataset_config(dataset_name: str) -> None:
+    """Set module-level path globals based on dataset selection."""
+    global DATA_DIR, DOCUMENTS_FILE, EMBEDDINGS_1024_FILE, EMBEDDINGS_128_FILE
+    global FOCAL_DIRECTION_FILE, BUSEMANN_DEPTHS_FILE
+    global COSINE_COLLECTION, UNIFIED_COLLECTION
+
+    cfg = DATASET_CONFIGS[dataset_name]
+    DATA_DIR = cfg["data_dir"]
+    DOCUMENTS_FILE = DATA_DIR / "documents.jsonl"
+    EMBEDDINGS_1024_FILE = DATA_DIR / "embeddings_1024d.npy"
+    EMBEDDINGS_128_FILE = DATA_DIR / "embeddings_128d.npy"
+    FOCAL_DIRECTION_FILE = DATA_DIR / "focal_direction.npy"
+    BUSEMANN_DEPTHS_FILE = DATA_DIR / "busemann_depths.npy"
+
+    COSINE_COLLECTION = f"{dataset_name}_cosine"
+    UNIFIED_COLLECTION = f"{dataset_name}_unified"
+
+    # Copy documents from source dataset dir if not already in testbench data
+    source_dir = cfg.get("source_dir")
+    if source_dir and source_dir.exists():
+        source_docs = source_dir / "documents.jsonl"
+        if source_docs.exists() and not DOCUMENTS_FILE.exists():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(source_docs, DOCUMENTS_FILE)
+            print(f"Copied {dataset_name} data from {source_docs}")
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 CURVATURE = 5.0
 COSINE_COLLECTION = "wos_cosine"
+UNIFIED_COLLECTION = "wos_unified"
 VECTOR_DIM = 128
 
 STRATEGY_COLLECTIONS = {
@@ -57,25 +108,16 @@ STRATEGY_COLLECTIONS = {
     "einstein_spread": "wos_c50_spread",
 }
 
-UNIFIED_COLLECTION = "wos_unified"
-
 # Point ID offsets for unified collection
-CONTENT_ID_OFFSET = 0        # 0 .. 45,861
-STORY_ID_OFFSET = 100_000    # 100,000 .. 100,403
-NARRATIVE_ID_OFFSET = 200_000  # 200,000 .. 200,009
-
-# Cached file paths for new artifacts
-FOCAL_DIRECTION_FILE = DATA_DIR / "focal_direction.npy"
-BUSEMANN_DEPTHS_FILE = DATA_DIR / "busemann_depths.npy"
-AREA_CENTROIDS_FILE = DATA_DIR / "area_centroids.npz"
-DOMAIN_CENTROIDS_FILE = DATA_DIR / "domain_centroids.npz"
+CONTENT_ID_OFFSET = 0
+STORY_ID_OFFSET = 100_000
+NARRATIVE_ID_OFFSET = 200_000
 
 LEGACY_COLLECTIONS = [
     "wos_c50_uniform",
     "wos_c50_static",
     "wos_c50_einstein",
     "wos_c50_spread",
-    # Round 1 legacy collections
     "wos_c05",
     "wos_c10",
     "wos_c20",
@@ -567,6 +609,7 @@ def upsert_unified(
                     "domain": doc["domain"],
                     "area": doc["area"],
                     "hierarchy_path": doc["hierarchy_path"],
+                    "all_paths": doc.get("all_paths", [doc["hierarchy_path"]]),
                     "source_ids": [],
                 },
             ))
@@ -742,10 +785,22 @@ def main() -> None:
         action="store_true",
         help="Run curvature sweep: create temporary unified collections at c=1,2,5,10",
     )
+    parser.add_argument(
+        "--dataset",
+        default="wos",
+        choices=list(DATASET_CONFIGS.keys()),
+        help="Which dataset to use (default: wos). Options: wos, bgc, scihtc",
+    )
     args = parser.parse_args()
 
     random.seed(42)
     np.random.seed(42)
+
+    # Apply dataset configuration
+    _apply_dataset_config(args.dataset)
+    print(f"Dataset: {args.dataset}")
+    print(f"Data dir: {DATA_DIR}")
+    print(f"Collections: {COSINE_COLLECTION}, {UNIFIED_COLLECTION}")
 
     # ------------------------------------------------------------------
     # Step 1: Load documents
