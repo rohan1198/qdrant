@@ -62,6 +62,11 @@ DATASET_CONFIGS = {
         "documents": SCRIPT_DIR / "data" / "scihtc" / "documents.jsonl",
         "source_dir": SCRIPT_DIR.parent / "datasets" / "scihtc" / "data",
     },
+    "eurlex": {
+        "data_dir": SCRIPT_DIR / "data" / "eurlex",
+        "documents": SCRIPT_DIR / "data" / "eurlex" / "documents.jsonl",
+        "source_dir": SCRIPT_DIR.parent / "datasets" / "eurlex" / "data",
+    },
 }
 
 
@@ -177,10 +182,22 @@ def embed_texts(texts: list[str]) -> np.ndarray:
         device="cuda",
     )
 
+    # Truncate long texts to ~512 tokens (~2000 chars) before encoding.
+    # The model's max sequence length is 512 tokens — longer text wastes
+    # GPU memory during tokenization without improving embeddings.
+    MAX_CHARS = 2000
+    truncated = 0
+    for i, t in enumerate(texts):
+        if len(t) > MAX_CHARS:
+            texts[i] = t[:MAX_CHARS]
+            truncated += 1
+    if truncated:
+        print(f"Truncated {truncated} texts to {MAX_CHARS} chars ({truncated/len(texts)*100:.1f}%)")
+
     print(f"Embedding {len(texts)} texts on GPU ...")
     embeddings = model.encode(
         texts,
-        batch_size=32,
+        batch_size=16,  # Safe with truncation
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=False,
