@@ -85,6 +85,16 @@ def discover_collections(client: QdrantClient, qdrant_url: str) -> list[dict]:
             strategy = "unified"
             curvature = DEFAULT_CURVATURE
 
+        # Detect curvature sweep collections (wos_unified_c10, wos_unified_c20, etc.)
+        elif name.startswith("wos_unified_c"):
+            is_poincare = True
+            strategy = "unified"
+            suffix = name.replace("wos_unified_c", "")
+            try:
+                curvature = int(suffix) / 10.0
+            except ValueError:
+                curvature = DEFAULT_CURVATURE
+
         # Infer strategy from collection name
         elif name == "wos_cosine":
             strategy = None
