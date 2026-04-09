@@ -26,6 +26,11 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 from projection import STRATEGIES
+from hyperbolic_math import (
+    busemann_depth_single,
+    compute_focal_direction,
+    einstein_midpoint,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -51,6 +56,31 @@ STRATEGY_COLLECTIONS = {
     "einstein": "wos_c50_einstein",
     "einstein_spread": "wos_c50_spread",
 }
+
+UNIFIED_COLLECTION = "wos_unified"
+
+# Point ID offsets for unified collection
+CONTENT_ID_OFFSET = 0        # 0 .. 45,861
+STORY_ID_OFFSET = 100_000    # 100,000 .. 100,403
+NARRATIVE_ID_OFFSET = 200_000  # 200,000 .. 200,009
+
+# Cached file paths for new artifacts
+FOCAL_DIRECTION_FILE = DATA_DIR / "focal_direction.npy"
+BUSEMANN_DEPTHS_FILE = DATA_DIR / "busemann_depths.npy"
+AREA_CENTROIDS_FILE = DATA_DIR / "area_centroids.npz"
+DOMAIN_CENTROIDS_FILE = DATA_DIR / "domain_centroids.npz"
+
+LEGACY_COLLECTIONS = [
+    "wos_c50_uniform",
+    "wos_c50_static",
+    "wos_c50_einstein",
+    "wos_c50_spread",
+    # Round 1 legacy collections
+    "wos_c05",
+    "wos_c10",
+    "wos_c20",
+    "wos_c50",
+]
 
 # ---------------------------------------------------------------------------
 # Document loading
@@ -185,6 +215,165 @@ def reduce_pca(embeddings: np.ndarray, tiers: list[str]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Busemann depth computation
+# ---------------------------------------------------------------------------
+
+
+def compute_busemann(poincare_vectors: np.ndarray, c: float) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Busemann depths for all vectors. Returns (depths, focal_direction).
+
+    Results cached to disk.
+    """
+    if FOCAL_DIRECTION_FILE.exists() and BUSEMANN_DEPTHS_FILE.exists():
+        print(f"Loading cached Busemann data ...")
+        focal = np.load(FOCAL_DIRECTION_FILE)
+        depths = np.load(BUSEMANN_DEPTHS_FILE)
+        if depths.shape[0] == poincare_vectors.shape[0]:
+            print(f"  Cache hit: {depths.shape[0]} depths, focal dim={focal.shape[0]}")
+            return depths, focal
+
+    print("Computing focal direction from all content vectors ...")
+    vectors_list = [poincare_vectors[i] for i in range(len(poincare_vectors))]
+    focal = compute_focal_direction(vectors_list, c=c)
+
+    print("Computing Busemann depths ...")
+    depths = np.array([
+        busemann_depth_single(poincare_vectors[i], focal, c=c)
+        for i in range(len(poincare_vectors))
+    ], dtype=np.float32)
+
+    print(f"  Depth stats — min: {depths.min():.4f}, max: {depths.max():.4f}, "
+          f"mean: {depths.mean():.4f}, std: {depths.std():.4f}")
+
+    np.save(FOCAL_DIRECTION_FILE, focal)
+    np.save(BUSEMANN_DEPTHS_FILE, depths)
+    print(f"  Saved focal direction and depths to {DATA_DIR}")
+    return depths, focal
+
+
+# ---------------------------------------------------------------------------
+# Tier centroid generation
+# ---------------------------------------------------------------------------
+
+
+def generate_tier_centroids(
+    docs: list[dict],
+    cosine_vectors: np.ndarray,
+    poincare_vectors: np.ndarray,
+    busemann_depths: np.ndarray,
+    focal: np.ndarray,
+    c: float,
+) -> tuple[list[dict], list[dict]]:
+    """Generate area (story) and domain (narrative) centroids.
+
+    Returns (area_entries, domain_entries) where each entry is a dict:
+      {"id": int, "cosine": np.ndarray, "poincare": np.ndarray,
+       "busemann_depth": float, "tier": str, "domain": str, "area": str,
+       "hierarchy_path": str, "source_ids": list[int]}
+    """
+    # Group papers by area and domain
+    area_groups: dict[str, list[int]] = {}
+    domain_groups: dict[str, set] = {}
+
+    for i, doc in enumerate(docs):
+        area = doc["area"]
+        domain = doc["domain"]
+        if area not in area_groups:
+            area_groups[area] = []
+        area_groups[area].append(i)
+        if domain not in domain_groups:
+            domain_groups[domain] = set()
+        domain_groups[domain].add(area)
+
+    # Convert domain_groups values to sorted lists
+    for d in domain_groups:
+        domain_groups[d] = sorted(domain_groups[d])
+
+    print(f"Generating centroids for {len(area_groups)} areas ...")
+
+    # --- Area (Story) centroids ---
+    area_entries = []
+    area_name_to_entry: dict[str, dict] = {}
+
+    for idx, (area_name, paper_indices) in enumerate(sorted(area_groups.items())):
+        # Cosine centroid: L2-normalized mean
+        cosine_vecs = cosine_vectors[paper_indices]
+        cosine_mean = cosine_vecs.mean(axis=0)
+        cosine_norm = np.linalg.norm(cosine_mean)
+        if cosine_norm > 1e-8:
+            cosine_mean = cosine_mean / cosine_norm
+        cosine_centroid = cosine_mean.astype(np.float32)
+
+        # Poincare centroid: Einstein midpoint
+        poincare_list = [poincare_vectors[i] for i in paper_indices]
+        poincare_centroid = einstein_midpoint(poincare_list, c=c)
+
+        # Busemann depth of the centroid
+        depth = busemann_depth_single(poincare_centroid, focal, c=c)
+
+        # Find the domain for this area
+        domain_name = docs[paper_indices[0]]["domain"]
+
+        entry = {
+            "id": STORY_ID_OFFSET + idx,
+            "cosine": cosine_centroid,
+            "poincare": poincare_centroid,
+            "busemann_depth": float(depth),
+            "tier": "story",
+            "domain": domain_name,
+            "area": area_name,
+            "hierarchy_path": f"{domain_name}/{area_name}",
+            "source_ids": paper_indices,
+        }
+        area_entries.append(entry)
+        area_name_to_entry[area_name] = entry
+
+    print(f"  Generated {len(area_entries)} area centroids")
+
+    # --- Domain (Narrative) centroids ---
+    print(f"Generating centroids for {len(domain_groups)} domains ...")
+    domain_entries = []
+
+    for idx, (domain_name, area_names) in enumerate(sorted(domain_groups.items())):
+        # Cosine centroid: L2-normalized mean of area cosine centroids
+        area_cosine_vecs = np.array([
+            area_name_to_entry[a]["cosine"] for a in area_names
+        ])
+        cosine_mean = area_cosine_vecs.mean(axis=0)
+        cosine_norm = np.linalg.norm(cosine_mean)
+        if cosine_norm > 1e-8:
+            cosine_mean = cosine_mean / cosine_norm
+        cosine_centroid = cosine_mean.astype(np.float32)
+
+        # Poincare centroid: Einstein midpoint of area poincare centroids
+        area_poincare_list = [area_name_to_entry[a]["poincare"] for a in area_names]
+        poincare_centroid = einstein_midpoint(area_poincare_list, c=c)
+
+        # Busemann depth of the centroid
+        depth = busemann_depth_single(poincare_centroid, focal, c=c)
+
+        # Source IDs: all area IDs under this domain
+        area_ids = [area_name_to_entry[a]["id"] for a in area_names]
+
+        entry = {
+            "id": NARRATIVE_ID_OFFSET + idx,
+            "cosine": cosine_centroid,
+            "poincare": poincare_centroid,
+            "busemann_depth": float(depth),
+            "tier": "narrative",
+            "domain": domain_name,
+            "area": "",
+            "hierarchy_path": domain_name,
+            "source_ids": area_ids,
+        }
+        domain_entries.append(entry)
+
+    print(f"  Generated {len(domain_entries)} domain centroids")
+
+    return area_entries, domain_entries
+
+
+# ---------------------------------------------------------------------------
 # Qdrant collection management
 # ---------------------------------------------------------------------------
 
@@ -295,6 +484,157 @@ def upsert_vectors(
 
 
 # ---------------------------------------------------------------------------
+# Unified collection management
+# ---------------------------------------------------------------------------
+
+
+def create_unified_collection(
+    qdrant_url: str,
+    name: str,
+    size: int,
+    curvature: float,
+) -> None:
+    """Create a unified collection with cosine + poincare named vectors."""
+    import requests
+
+    url = f"{qdrant_url}/collections/{name}"
+
+    # Delete if exists
+    requests.delete(url)
+
+    body = {
+        "vectors": {
+            "cosine": {
+                "size": size,
+                "distance": "Cosine",
+                "hnsw_config": {"m": 16, "ef_construct": 200},
+            },
+            "poincare": {
+                "size": size,
+                "distance": "Poincare",
+                "hnsw_config": {"m": 16, "ef_construct": 200},
+                "curvature": curvature,
+            },
+        },
+    }
+
+    resp = requests.put(url, json=body)
+    if resp.status_code == 200:
+        print(f"  Created unified collection '{name}' (cosine + poincare c={curvature})")
+        return
+
+    # Retry without curvature if not supported
+    print(f"  Note: PUT returned {resp.status_code}, retrying without curvature field ...")
+    body["vectors"]["poincare"].pop("curvature")
+    resp2 = requests.put(url, json=body)
+    resp2.raise_for_status()
+    print(f"  Created unified collection '{name}' (curvature param unsupported)")
+
+
+def upsert_unified(
+    client,
+    collection_name: str,
+    content_docs: list[dict],
+    cosine_vectors: np.ndarray,
+    poincare_vectors: np.ndarray,
+    busemann_depths: np.ndarray,
+    area_entries: list[dict],
+    domain_entries: list[dict],
+) -> None:
+    """Upsert all three tiers into the unified collection."""
+    from qdrant_client.models import PointStruct
+
+    # --- Content tier ---
+    print(f"  Upserting {len(content_docs)} content points ...")
+    total = len(content_docs)
+    n_batches = (total + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE
+
+    for batch_idx in tqdm(range(n_batches), desc="    content"):
+        start = batch_idx * UPSERT_BATCH_SIZE
+        end = min(start + UPSERT_BATCH_SIZE, total)
+        points = []
+        for i in range(start, end):
+            doc = content_docs[i]
+            points.append(PointStruct(
+                id=CONTENT_ID_OFFSET + i,
+                vector={
+                    "cosine": cosine_vectors[i].tolist(),
+                    "poincare": poincare_vectors[i].tolist(),
+                },
+                payload={
+                    "tier": "content",
+                    "busemann_depth": float(busemann_depths[i]),
+                    "domain": doc["domain"],
+                    "area": doc["area"],
+                    "hierarchy_path": doc["hierarchy_path"],
+                    "source_ids": [],
+                },
+            ))
+        client.upsert(collection_name=collection_name, points=points)
+
+    # --- Story tier (areas) ---
+    print(f"  Upserting {len(area_entries)} story points ...")
+    story_points = []
+    for entry in area_entries:
+        story_points.append(PointStruct(
+            id=entry["id"],
+            vector={
+                "cosine": entry["cosine"].tolist(),
+                "poincare": entry["poincare"].tolist(),
+            },
+            payload={
+                "tier": "story",
+                "busemann_depth": entry["busemann_depth"],
+                "domain": entry["domain"],
+                "area": entry["area"],
+                "hierarchy_path": entry["hierarchy_path"],
+                "source_ids": entry["source_ids"][:20],
+            },
+        ))
+    client.upsert(collection_name=collection_name, points=story_points)
+
+    # --- Narrative tier (domains) ---
+    print(f"  Upserting {len(domain_entries)} narrative points ...")
+    narrative_points = []
+    for entry in domain_entries:
+        narrative_points.append(PointStruct(
+            id=entry["id"],
+            vector={
+                "cosine": entry["cosine"].tolist(),
+                "poincare": entry["poincare"].tolist(),
+            },
+            payload={
+                "tier": "narrative",
+                "busemann_depth": entry["busemann_depth"],
+                "domain": entry["domain"],
+                "area": "",
+                "hierarchy_path": entry["hierarchy_path"],
+                "source_ids": entry["source_ids"],
+            },
+        ))
+    client.upsert(collection_name=collection_name, points=narrative_points)
+
+    total_pts = len(content_docs) + len(area_entries) + len(domain_entries)
+    print(f"  Upserted {total_pts} total points into '{collection_name}'")
+
+
+def cleanup_legacy_collections(client, qdrant_url: str) -> None:
+    """Delete legacy per-strategy collections to free space."""
+    import requests
+
+    existing = client.get_collections().collections
+    existing_names = {c.name for c in existing}
+
+    for name in LEGACY_COLLECTIONS:
+        if name in existing_names:
+            resp = requests.delete(f"{qdrant_url}/collections/{name}")
+            if resp.status_code == 200:
+                print(f"  Deleted legacy collection '{name}'")
+            else:
+                print(f"  Warning: failed to delete '{name}': {resp.status_code}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -319,30 +659,25 @@ def main() -> None:
         help="Prepare embeddings but do not upsert into Qdrant",
     )
     parser.add_argument(
-        "--strategy",
-        default="all",
+        "--mode",
+        default="unified",
+        choices=["unified", "legacy", "all"],
         help=(
-            "Comma-separated projection strategies to run. "
-            "Options: uniform, static, einstein, einstein_spread, all. "
-            "Default: all"
+            "Which collections to create. "
+            "'unified' = wos_cosine + wos_unified (default). "
+            "'legacy' = per-strategy collections (round 2 compat). "
+            "'all' = both."
         ),
+    )
+    parser.add_argument(
+        "--cleanup-legacy",
+        action="store_true",
+        help="Delete legacy per-strategy collections to free space",
     )
     args = parser.parse_args()
 
     random.seed(42)
     np.random.seed(42)
-
-    # Parse strategies
-    if args.strategy == "all":
-        strategies_to_run = list(STRATEGIES.keys())
-    else:
-        strategies_to_run = [s.strip() for s in args.strategy.split(",")]
-        for s in strategies_to_run:
-            if s not in STRATEGIES:
-                parser.error(
-                    f"Unknown strategy '{s}'. "
-                    f"Choose from: {', '.join(STRATEGIES.keys())}, all"
-                )
 
     # ------------------------------------------------------------------
     # Step 1: Load documents
@@ -382,67 +717,107 @@ def main() -> None:
         print("Done.")
         return
 
-    # ------------------------------------------------------------------
-    # Step 4 & 5: Create collections and upsert
-    # ------------------------------------------------------------------
     from qdrant_client import QdrantClient
 
     qdrant_url = args.qdrant_url
-    print(f"\n=== Step 4: Create Qdrant collections (url={qdrant_url}) ===")
-
     client = QdrantClient(url=qdrant_url)
 
-    # Cosine baseline
-    print("Creating cosine baseline collection ...")
-    create_cosine_collection(client, COSINE_COLLECTION, size=VECTOR_DIM)
+    # ------------------------------------------------------------------
+    # Optional: Cleanup legacy collections
+    # ------------------------------------------------------------------
+    if args.cleanup_legacy:
+        print("\n=== Cleaning up legacy collections ===")
+        cleanup_legacy_collections(client, qdrant_url)
 
-    print("\n=== Step 5: Project and upsert (c={}, strategies={}) ===".format(
-        CURVATURE, strategies_to_run
-    ))
+    run_unified = args.mode in ("unified", "all")
+    run_legacy = args.mode in ("legacy", "all")
 
-    # Cosine: use PCA-reduced vectors directly
-    print("Upserting cosine collection ...")
-    upsert_vectors(client, COSINE_COLLECTION, docs, embeddings_128)
+    # ------------------------------------------------------------------
+    # Step 4: Project to Poincare (einstein_spread)
+    # ------------------------------------------------------------------
+    print(f"\n=== Step 4: Project to Poincare ball (c={CURVATURE}, einstein_spread) ===")
+    strategy_fn = STRATEGIES["einstein_spread"]
+    result = strategy_fn(embeddings_128, tiers, c=CURVATURE)
+    poincare_vectors = result["vectors"]
+    metadata = result["metadata"]
 
-    # Poincare: project with each strategy, then upsert
-    for strategy_name in strategies_to_run:
-        coll_name = STRATEGY_COLLECTIONS[strategy_name]
-        print(f"\nProjecting with strategy '{strategy_name}' (c={CURVATURE}) ...")
+    print(f"  Norm stats — min: {metadata['norm_stats']['min']:.4f}, "
+          f"max: {metadata['norm_stats']['max']:.4f}, "
+          f"mean: {metadata['norm_stats']['mean']:.4f}")
+    if "tier_radii" in metadata:
+        print(f"  Tier radii: {metadata['tier_radii']}")
 
-        create_poincare_collection(
-            qdrant_url, coll_name, size=VECTOR_DIM, curvature=CURVATURE
+    # ------------------------------------------------------------------
+    # Step 5: Compute Busemann depths
+    # ------------------------------------------------------------------
+    print(f"\n=== Step 5: Compute Busemann depths ===")
+    busemann_depths, focal = compute_busemann(poincare_vectors, c=CURVATURE)
+
+    # ------------------------------------------------------------------
+    # Step 6: Generate tier centroids
+    # ------------------------------------------------------------------
+    print(f"\n=== Step 6: Generate tier centroids ===")
+    area_entries, domain_entries = generate_tier_centroids(
+        docs, embeddings_128, poincare_vectors, busemann_depths, focal, c=CURVATURE,
+    )
+
+    # Print centroid depth stats
+    area_depths = [e["busemann_depth"] for e in area_entries]
+    domain_depths = [e["busemann_depth"] for e in domain_entries]
+    content_depth_mean = float(busemann_depths.mean())
+    print(f"  Depth summary:")
+    print(f"    Narratives (domains): mean={np.mean(domain_depths):.4f}, n={len(domain_depths)}")
+    print(f"    Stories (areas):      mean={np.mean(area_depths):.4f}, n={len(area_depths)}")
+    print(f"    Content (papers):     mean={content_depth_mean:.4f}, n={len(docs)}")
+
+    # ------------------------------------------------------------------
+    # Step 7: Create collections and upsert
+    # ------------------------------------------------------------------
+    if run_unified:
+        print(f"\n=== Step 7a: Unified collection ===")
+
+        # Cosine baseline
+        print("Creating cosine baseline collection ...")
+        create_cosine_collection(client, COSINE_COLLECTION, size=VECTOR_DIM)
+        print("Upserting cosine collection ...")
+        upsert_vectors(client, COSINE_COLLECTION, docs, embeddings_128)
+
+        # Unified collection
+        print("\nCreating unified collection ...")
+        create_unified_collection(qdrant_url, UNIFIED_COLLECTION, size=VECTOR_DIM, curvature=CURVATURE)
+        upsert_unified(
+            client, UNIFIED_COLLECTION,
+            docs, embeddings_128, poincare_vectors, busemann_depths,
+            area_entries, domain_entries,
         )
 
-        strategy_fn = STRATEGIES[strategy_name]
-        result = strategy_fn(embeddings_128, tiers, c=CURVATURE)
-        projected = result["vectors"]
-        metadata = result["metadata"]
-
-        norm_stats = metadata.get("norm_stats", {})
-        print(
-            f"  Norm stats — min: {norm_stats.get('min', 0):.4f}, "
-            f"max: {norm_stats.get('max', 0):.4f}, "
-            f"mean: {norm_stats.get('mean', 0):.4f}"
+        # Create payload indices for server-side filtering
+        print("Creating payload indices ...")
+        client.create_payload_index(
+            collection_name=UNIFIED_COLLECTION,
+            field_name="busemann_depth",
+            field_schema="float",
         )
+        client.create_payload_index(
+            collection_name=UNIFIED_COLLECTION,
+            field_name="tier",
+            field_schema="keyword",
+        )
+        print("  Created indices on 'busemann_depth' (float) and 'tier' (keyword)")
 
-        if "tier_radii" in metadata:
-            print(f"  Derived tier radii: {metadata['tier_radii']}")
+    if run_legacy:
+        print(f"\n=== Step 7b: Legacy per-strategy collections ===")
+        strategies_to_run = list(STRATEGIES.keys())
 
-        if "tier_norm_stats" in metadata:
-            for tier, stats in metadata["tier_norm_stats"].items():
-                print(
-                    f"  {tier:>5}: norm mean={stats['mean']:.4f}, "
-                    f"std={stats['std']:.4f}"
-                )
-
-        upsert_vectors(client, coll_name, docs, projected)
+        for strategy_name in strategies_to_run:
+            coll_name = STRATEGY_COLLECTIONS[strategy_name]
+            print(f"\nProjecting with strategy '{strategy_name}' (c={CURVATURE}) ...")
+            create_poincare_collection(qdrant_url, coll_name, size=VECTOR_DIM, curvature=CURVATURE)
+            strat_fn = STRATEGIES[strategy_name]
+            strat_result = strat_fn(embeddings_128, tiers, c=CURVATURE)
+            upsert_vectors(client, coll_name, docs, strat_result["vectors"])
 
     print("\nAll done.")
-    print("Collections created and populated:")
-    print(f"  {COSINE_COLLECTION:<20} — 128d cosine baseline")
-    for strategy_name in strategies_to_run:
-        coll_name = STRATEGY_COLLECTIONS[strategy_name]
-        print(f"  {coll_name:<20} — Poincare c={CURVATURE} ({strategy_name})")
 
 
 if __name__ == "__main__":
