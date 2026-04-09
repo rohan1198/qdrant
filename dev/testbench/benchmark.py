@@ -45,6 +45,74 @@ NARRATIVE_ID_OFFSET = 200_000
 
 
 # ---------------------------------------------------------------------------
+# Multi-label matching
+# ---------------------------------------------------------------------------
+
+
+def _get_paths(pt: dict) -> list[str]:
+    """Get hierarchy paths from a point, with robust fallback.
+
+    Priority: all_paths (if non-empty) > hierarchy_path > domain/area reconstruction.
+    All returned values are guaranteed to be strings.
+    """
+    paths = pt.get("all_paths") or []
+    if paths:
+        return [str(p) for p in paths]
+
+    hp = pt.get("hierarchy_path", "")
+    if hp:
+        return [str(hp)]
+
+    # Last resort: reconstruct from domain/area
+    domain = pt.get("domain", "")
+    area = pt.get("area", "")
+    if domain and area:
+        return [f"{domain}/{area}"]
+    elif domain:
+        return [str(domain)]
+    return []
+
+
+def _paths_match_area(query_pt: dict, result_pt: dict) -> bool:
+    """Check if result shares an L2 (area) category with query, considering all_paths."""
+    q_paths = _get_paths(query_pt)
+    r_paths = _get_paths(result_pt)
+
+    # Extract L2 prefixes (first 2 components of each path)
+    q_areas = set()
+    for p in q_paths:
+        parts = p.split("/")
+        if len(parts) >= 2:
+            q_areas.add("/".join(parts[:2]))
+    r_areas = set()
+    for p in r_paths:
+        parts = p.split("/")
+        if len(parts) >= 2:
+            r_areas.add("/".join(parts[:2]))
+
+    # Fallback to exact area match if no 2-component paths
+    if not q_areas or not r_areas:
+        return query_pt.get("area") == result_pt.get("area") and query_pt.get("area") not in (None, "", -1)
+
+    return bool(q_areas & r_areas)
+
+
+def _paths_match_domain(query_pt: dict, result_pt: dict) -> bool:
+    """Check if result shares an L1 (domain) category with query, considering all_paths."""
+    q_paths = _get_paths(query_pt)
+    r_paths = _get_paths(result_pt)
+
+    q_domains = {p.split("/")[0] for p in q_paths if p}
+    r_domains = {p.split("/")[0] for p in r_paths if p}
+
+    # Fallback to exact domain match
+    if not q_domains or not r_domains:
+        return query_pt.get("domain") == result_pt.get("domain") and query_pt.get("domain") not in (None, "", -1)
+
+    return bool(q_domains & r_domains)
+
+
+# ---------------------------------------------------------------------------
 # Collection discovery
 # ---------------------------------------------------------------------------
 
@@ -192,6 +260,8 @@ def scroll_all(
                 "domain": pt.payload.get("domain", -1),
                 "area": pt.payload.get("area", -1),
                 "busemann_depth": pt.payload.get("busemann_depth"),
+                "all_paths": pt.payload.get("all_paths", []),
+                "hierarchy_path": pt.payload.get("hierarchy_path", ""),
             }
             if all_vectors is not None:
                 entry["vectors"] = all_vectors
@@ -515,10 +585,10 @@ def benchmark_retrieval_quality(
             if nb_pt is None:
                 continue
 
-            if nb_pt["area"] == query_pt["area"]:
+            if _paths_match_area(query_pt, nb_pt):
                 same_area += 1
                 h_prec += 1.0
-            elif nb_pt["domain"] == query_pt["domain"]:
+            elif _paths_match_domain(query_pt, nb_pt):
                 same_domain += 1
                 h_prec += 0.5
 
@@ -601,10 +671,10 @@ def benchmark_retrieval_modes(
                 nb_pt = id_to_pt.get(nb.id)
                 if nb_pt is None:
                     continue
-                if nb_pt["area"] == qpt["area"]:
+                if _paths_match_area(qpt, nb_pt):
                     same_area += 1
                     h_prec += 1.0
-                elif nb_pt["domain"] == qpt["domain"]:
+                elif _paths_match_domain(qpt, nb_pt):
                     same_domain += 1
                     h_prec += 0.5
 
@@ -797,9 +867,9 @@ def benchmark_dual_space(
                 nb_pt = id_to_pt.get(nb_id)
                 if nb_pt is None:
                     continue
-                if nb_pt["area"] == query_area:
+                if _paths_match_area(qpt, nb_pt):
                     same_area += 1
-                elif nb_pt["domain"] == query_domain:
+                elif _paths_match_domain(qpt, nb_pt):
                     same_domain += 1
             return same_area / k, (same_area + same_domain) / k
 

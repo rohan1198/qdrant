@@ -194,10 +194,19 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     if truncated:
         print(f"Truncated {truncated} texts to {MAX_CHARS} chars ({truncated/len(texts)*100:.1f}%)")
 
-    print(f"Embedding {len(texts)} texts on GPU ...")
+    # Adaptive batch size based on text length distribution
+    avg_len = sum(len(t) for t in texts) / len(texts) if texts else 0
+    if avg_len > 1500:
+        batch_size = 8
+    elif avg_len > 500:
+        batch_size = 16
+    else:
+        batch_size = 32
+    print(f"Embedding {len(texts)} texts on GPU (batch_size={batch_size}, avg_len={avg_len:.0f} chars)...")
+
     embeddings = model.encode(
         texts,
-        batch_size=16,  # Safe with truncation
+        batch_size=batch_size,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=False,
@@ -532,6 +541,7 @@ def upsert_vectors(
                 "domain": doc["domain"],
                 "area": doc["area"],
                 "hierarchy_path": doc["hierarchy_path"],
+                "all_paths": doc.get("all_paths", [doc["hierarchy_path"]]),
             }
             points.append(
                 PointStruct(
