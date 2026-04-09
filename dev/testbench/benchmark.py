@@ -63,9 +63,18 @@ def discover_collections(client: QdrantClient, qdrant_url: str) -> list[dict]:
     existing = client.get_collections().collections
     collections = []
 
+    KNOWN_PREFIXES = ["wos_", "bgc_", "scihtc_"]
+
     for col_info in existing:
         name = col_info.name
-        if not name.startswith("wos_"):
+
+        # Check if collection matches any known prefix
+        matched_prefix = None
+        for pfx in KNOWN_PREFIXES:
+            if name.startswith(pfx):
+                matched_prefix = pfx.rstrip("_")
+                break
+        if matched_prefix is None:
             continue
 
         # Use REST API to get distance type (SDK chokes on Poincare)
@@ -79,24 +88,24 @@ def discover_collections(client: QdrantClient, qdrant_url: str) -> list[dict]:
 
         is_poincare = "poincare" in distance.lower()
 
-        # Detect unified collection (named vectors)
-        if name == "wos_unified":
+        # Detect unified collection (named vectors) — any prefix
+        if name == f"{matched_prefix}_unified":
             is_poincare = True
             strategy = "unified"
             curvature = DEFAULT_CURVATURE
 
-        # Detect curvature sweep collections (wos_unified_c10, wos_unified_c20, etc.)
-        elif name.startswith("wos_unified_c"):
+        # Detect curvature sweep collections ({prefix}_unified_c10, etc.)
+        elif name.startswith(f"{matched_prefix}_unified_c"):
             is_poincare = True
             strategy = "unified"
-            suffix = name.replace("wos_unified_c", "")
+            suffix = name.replace(f"{matched_prefix}_unified_c", "")
             try:
                 curvature = int(suffix) / 10.0
             except ValueError:
                 curvature = DEFAULT_CURVATURE
 
-        # Infer strategy from collection name
-        elif name == "wos_cosine":
+        # Cosine baseline — any prefix
+        elif name == f"{matched_prefix}_cosine":
             strategy = None
             curvature = None
         elif "_uniform" in name:
@@ -1006,8 +1015,16 @@ def main() -> None:
     results_dir.mkdir(exist_ok=True)
     output_path = results_dir / f"benchmark_{timestamp}.json"
 
-    has_unified = any(c["name"] == UNIFIED_COLLECTION for c in collection_configs)
-    has_cosine = any(c["name"] == "wos_cosine" for c in collection_configs)
+    # Find unified + cosine collection pairs (works for any prefix: wos, bgc, scihtc)
+    unified_name = None
+    cosine_name = None
+    for c in collection_configs:
+        if c.get("strategy") == "unified" and "_c" not in c["name"].replace("_cosine", ""):
+            unified_name = c["name"]
+        if c.get("strategy") is None and c["name"].endswith("_cosine"):
+            cosine_name = c["name"]
+    has_unified = unified_name is not None
+    has_cosine = cosine_name is not None
 
     # --- Standard per-collection benchmarks ---
     for col_cfg in collection_configs:
@@ -1073,14 +1090,16 @@ def main() -> None:
 
     # --- Unified-specific benchmarks ---
     if has_unified and has_cosine:
+        print(f"\n  Using unified={unified_name}, cosine={cosine_name}")
+
         # --- Benchmark 3: Cross-Tier Retrieval ---
         if args.suite in ("all", "cross-tier"):
             print(f"\n{'='*60}")
-            print("Cross-Tier Retrieval (wos_unified, poincare)")
+            print(f"Cross-Tier Retrieval ({unified_name}, poincare)")
             print(f"{'='*60}")
-            points_unified = scroll_all(client, UNIFIED_COLLECTION, vector_name="poincare")
-            ct_res = benchmark_cross_tier(client, UNIFIED_COLLECTION, points_unified, k=5)
-            all_results.setdefault(UNIFIED_COLLECTION, {})["cross_tier"] = ct_res
+            points_unified = scroll_all(client, unified_name, vector_name="poincare")
+            ct_res = benchmark_cross_tier(client, unified_name, points_unified, k=5)
+            all_results.setdefault(unified_name, {})["cross_tier"] = ct_res
             print(f"  parent_story_recall:     {ct_res.get('parent_story_recall')}")
             print(f"  parent_narrative_recall:  {ct_res.get('parent_narrative_recall')}")
             print(f"  child_story_recall:       {ct_res.get('child_story_recall')}")
@@ -1088,11 +1107,11 @@ def main() -> None:
         # --- Benchmark 2b: Multi-Mode Retrieval ---
         if args.suite in ("all", "retrieval"):
             print(f"\n{'='*60}")
-            print("Multi-Mode Retrieval Quality (wos_unified)")
+            print(f"Multi-Mode Retrieval Quality ({unified_name})")
             print(f"{'='*60}")
-            points_unified_poincare = scroll_all(client, UNIFIED_COLLECTION, vector_name="poincare")
-            mr_res = benchmark_retrieval_modes(client, UNIFIED_COLLECTION, points_unified_poincare, k=10, num_queries=500)
-            all_results.setdefault(UNIFIED_COLLECTION, {})["retrieval_modes"] = mr_res
+            points_unified_poincare = scroll_all(client, unified_name, vector_name="poincare")
+            mr_res = benchmark_retrieval_modes(client, unified_name, points_unified_poincare, k=10, num_queries=500)
+            all_results.setdefault(unified_name, {})["retrieval_modes"] = mr_res
 
             print(f"\n  {'Mode':<24} {'AreaRec@10':>12} {'DomRec@10':>12} {'H-Prec':>8}")
             print(f"  {'-'*56}")
@@ -1113,14 +1132,14 @@ def main() -> None:
             print(f"\n{'='*60}")
             print("Fusion Strategy Comparison")
             print(f"{'='*60}")
-            points_unified_cosine = scroll_all(client, UNIFIED_COLLECTION, vector_name="cosine")
-            points_cosine_baseline = scroll_all(client, "wos_cosine")
+            points_unified_cosine = scroll_all(client, unified_name, vector_name="cosine")
+            points_cosine_baseline = scroll_all(client, cosine_name)
             ds_res = benchmark_dual_space(
-                client, UNIFIED_COLLECTION, "wos_cosine",
+                client, unified_name, cosine_name,
                 points_unified_cosine, points_cosine_baseline,
                 k=10, num_queries=500,
             )
-            all_results.setdefault(UNIFIED_COLLECTION, {})["dual_space"] = ds_res
+            all_results.setdefault(unified_name, {})["dual_space"] = ds_res
 
             # Sort strategies by area_recall descending
             strat_scores = []
