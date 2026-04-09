@@ -63,7 +63,7 @@ def discover_collections(client: QdrantClient, qdrant_url: str) -> list[dict]:
     existing = client.get_collections().collections
     collections = []
 
-    KNOWN_PREFIXES = ["wos_", "bgc_", "scihtc_"]
+    KNOWN_PREFIXES = ["wos_", "bgc_", "scihtc_", "eurlex_"]
 
     for col_info in existing:
         name = col_info.name
@@ -1023,7 +1023,7 @@ def main() -> None:
     for c in collection_configs:
         # Extract prefix from name (e.g., "wos" from "wos_unified")
         name = c["name"]
-        for pfx in ["wos", "bgc", "scihtc"]:
+        for pfx in ["wos", "bgc", "scihtc", "eurlex"]:
             if name.startswith(pfx + "_"):
                 if c.get("strategy") == "unified" and "_c" not in name.replace(pfx + "_unified", ""):
                     prefix_unified[pfx] = name
