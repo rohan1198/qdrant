@@ -359,6 +359,28 @@ impl<'a> NamedVectors<'a> {
         dense_vector: DenseVector,
         config: &VectorDataConfig,
     ) -> DenseVector {
+        #[cfg(feature = "hyperbolic")]
+        {
+            let curvature = config.curvature();
+            return match config.datatype {
+                Some(VectorStorageDatatype::Float32) | None => config
+                    .distance
+                    .preprocess_vector_with_curvature::<VectorElementType>(dense_vector, curvature),
+                Some(VectorStorageDatatype::Uint8) => config
+                    .distance
+                    .preprocess_vector_with_curvature::<VectorElementTypeByte>(
+                        dense_vector,
+                        curvature,
+                    ),
+                Some(VectorStorageDatatype::Float16) => config
+                    .distance
+                    .preprocess_vector_with_curvature::<VectorElementTypeHalf>(
+                        dense_vector,
+                        curvature,
+                    ),
+            };
+        }
+        #[cfg(not(feature = "hyperbolic"))]
         match config.datatype {
             Some(VectorStorageDatatype::Float32) | None => config
                 .distance

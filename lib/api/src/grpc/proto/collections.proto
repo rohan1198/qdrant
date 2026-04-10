@@ -140,6 +140,7 @@ enum Distance {
   Euclid = 2;
   Dot = 3;
   Manhattan = 4;
+  Poincare = 5;
 }
 
 enum CollectionStatus {

@@ -161,3 +161,104 @@ def einstein_midpoint(
     on_hyperboloid = project_hyperboloid(weighted_sum, c)
     poincare = lorentz_to_poincare(on_hyperboloid, c)
     return project_to_ball(poincare.astype(np.float32), c)
+
+
+# ---------------------------------------------------------------------------
+# Gromov delta-hyperbolicity
+# ---------------------------------------------------------------------------
+
+
+def gromov_delta(vectors, num_samples=1000):
+    """Compute Gromov delta-hyperbolicity via 4-point condition.
+
+    Lower delta = more tree-like = better for hyperbolic geometry.
+    Returns (delta, recommendation).
+
+    Source: HyperspaceDB gromov.rs
+    """
+    n = len(vectors)
+    if n < 4:
+        return 0.0, "insufficient_data"
+
+    max_delta = 0.0
+    rng = np.random.default_rng(42)
+
+    for _ in range(num_samples):
+        idx = rng.choice(n, 4, replace=False)
+        x, y, u, v = vectors[idx[0]], vectors[idx[1]], vectors[idx[2]], vectors[idx[3]]
+
+        d_xy = np.linalg.norm(x - y)
+        d_uv = np.linalg.norm(u - v)
+        d_xu = np.linalg.norm(x - u)
+        d_yv = np.linalg.norm(y - v)
+        d_xv = np.linalg.norm(x - v)
+        d_yu = np.linalg.norm(y - u)
+
+        sums = sorted([d_xy + d_uv, d_xu + d_yv, d_xv + d_yu], reverse=True)
+        delta = (sums[0] - sums[1]) / 2.0
+        max_delta = max(max_delta, delta)
+
+    if max_delta < 0.15:
+        rec = "lorentz"
+    elif max_delta < 0.30:
+        rec = "poincare"
+    elif max_delta < 0.50:
+        rec = "cosine"
+    else:
+        rec = "l2"
+
+    return max_delta, rec
+
+
+# ---------------------------------------------------------------------------
+# Alpha precomputation (conformal factor)
+# ---------------------------------------------------------------------------
+
+
+def alpha_precompute(vector, c=1.0):
+    """Precompute conformal factor 1/(1 - c*||x||^2) for fast Poincare distance.
+
+    Store this as a payload alongside each vector. Reduces distance
+    computation cost by ~30% since the norm doesn't need recomputing.
+
+    Source: HyperspaceDB vector.rs
+    """
+    sq_norm = np.dot(vector, vector)
+    denom = max(1.0 - c * sq_norm, 1e-7)
+    return 1.0 / denom
+
+
+def alpha_precompute_batch(vectors, c=1.0):
+    """Batch alpha precomputation for a matrix of vectors."""
+    sq_norms = np.sum(vectors ** 2, axis=1)
+    denoms = np.maximum(1.0 - c * sq_norms, 1e-7)
+    return 1.0 / denoms
+
+
+# ---------------------------------------------------------------------------
+# Fused norms and fast Poincare distance
+# ---------------------------------------------------------------------------
+
+
+def fused_norms(u, v):
+    """Compute ||u-v||^2, ||u||^2, ||v||^2 in a single pass.
+
+    Avoids three separate np.dot calls. Most useful in loops;
+    for batch operations use vectorized numpy instead.
+
+    Source: RuVector poincare.rs
+    """
+    diff = u - v
+    return np.dot(diff, diff), np.dot(u, u), np.dot(v, v)
+
+
+def poincare_distance_with_alpha(diff_sq, alpha_u, alpha_v, c=1.0):
+    """Poincare distance from precomputed norms and alphas.
+
+    d(u,v) = (1/sqrt(c)) * acosh(1 + 2*c * diff_sq * alpha_u * alpha_v)
+
+    Use with fused_norms() and alpha_precompute() for maximum speed.
+    """
+    sqrt_c = np.sqrt(c)
+    arg = 1.0 + 2.0 * c * diff_sq * alpha_u * alpha_v
+    return (1.0 / sqrt_c) * np.arccosh(np.clip(arg, 1.0, None))

@@ -19,32 +19,46 @@ wait_for_qdrant() {
     exit 1
 }
 
+DATASET="${2:-bgc}"
+
 case "${1:-all}" in
     all)
         echo "=== Building Qdrant with hyperbolic feature ==="
         docker compose up -d --build
         wait_for_qdrant
 
-        echo "=== Downloading dataset ==="
+        echo "=== Downloading dataset ($DATASET) ==="
         python3 download_dataset.py
 
-        echo "=== Embedding & uploading (unified) ==="
-        python3 embed.py --qdrant-url "$QDRANT_URL" --cleanup-legacy
+        echo "=== Embedding & uploading ($DATASET, unified) ==="
+        python3 embed.py --qdrant-url "$QDRANT_URL" --dataset "$DATASET" --cleanup-legacy
 
-        echo "=== Running benchmarks ==="
-        python3 benchmark.py --qdrant-url "$QDRANT_URL"
+        echo "=== Running benchmarks ($DATASET) ==="
+        python3 benchmark.py --qdrant-url "$QDRANT_URL" --dataset "$DATASET"
+        ;;
+    hwv)
+        wait_for_qdrant
+
+        echo "=== Preparing HWV dataset ==="
+        python3 ../datasets/hwv/prepare.py
+
+        echo "=== Embedding & uploading (hwv, unified) ==="
+        python3 embed.py --qdrant-url "$QDRANT_URL" --dataset hwv --cleanup-legacy
+
+        echo "=== Running benchmarks (hwv) ==="
+        python3 benchmark.py --qdrant-url "$QDRANT_URL" --dataset hwv
         ;;
     benchmark)
         wait_for_qdrant
-        echo "=== Running benchmarks ==="
-        python3 benchmark.py --qdrant-url "$QDRANT_URL"
+        echo "=== Running benchmarks ($DATASET) ==="
+        python3 benchmark.py --qdrant-url "$QDRANT_URL" --dataset "$DATASET"
         ;;
     embed)
         wait_for_qdrant
-        echo "=== Embedding & uploading (unified) ==="
-        python3 embed.py --qdrant-url "$QDRANT_URL" --cleanup-legacy
-        echo "=== Running benchmarks ==="
-        python3 benchmark.py --qdrant-url "$QDRANT_URL"
+        echo "=== Embedding & uploading ($DATASET, unified) ==="
+        python3 embed.py --qdrant-url "$QDRANT_URL" --dataset "$DATASET" --cleanup-legacy
+        echo "=== Running benchmarks ($DATASET) ==="
+        python3 benchmark.py --qdrant-url "$QDRANT_URL" --dataset "$DATASET"
         ;;
     rebuild)
         echo "=== Rebuilding Qdrant binary ==="
@@ -56,7 +70,8 @@ case "${1:-all}" in
         docker compose down -v
         ;;
     *)
-        echo "Usage: ./run.sh [all|benchmark|embed|rebuild|down]"
+        echo "Usage: ./run.sh [all|hwv|benchmark|embed|rebuild|down] [dataset]"
+        echo "  dataset: bgc (default), hwv, wos, eurlex"
         exit 1
         ;;
 esac

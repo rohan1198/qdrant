@@ -67,6 +67,14 @@ DATASET_CONFIGS = {
         "documents": SCRIPT_DIR / "data" / "eurlex" / "documents.jsonl",
         "source_dir": SCRIPT_DIR.parent / "datasets" / "eurlex" / "data",
     },
+    "hwv": {
+        "data_dir": SCRIPT_DIR / "data" / "hwv",
+        "documents": SCRIPT_DIR / "data" / "hwv" / "documents.jsonl",
+        "source_dir": Path(__file__).parent.parent / "datasets" / "hwv" / "data",
+        "doc_file": "documents.jsonl",
+        "tier_map": {"theme": "root", "narrative": "root", "story": "mid", "content": "leaf"},
+        "has_abstract": False,
+    },
 }
 
 
@@ -324,6 +332,73 @@ def compute_busemann(poincare_vectors: np.ndarray, c: float) -> tuple[np.ndarray
 
 
 # ---------------------------------------------------------------------------
+# Gromov delta analysis
+# ---------------------------------------------------------------------------
+
+
+def run_gromov_analysis(poincare_vectors, dataset_name):
+    """Run Gromov delta-hyperbolicity analysis on the dataset."""
+    from hyperbolic_math import gromov_delta
+
+    print(f"\n=== Gromov Delta Analysis ({dataset_name}) ===")
+    delta, recommendation = gromov_delta(poincare_vectors, num_samples=2000)
+    print(f"  Delta: {delta:.4f}")
+    print(f"  Recommendation: {recommendation}")
+    print(f"  Tree-like: {'yes' if delta < 0.3 else 'no'}")
+    return {"delta": delta, "recommendation": recommendation}
+
+
+# ---------------------------------------------------------------------------
+# Synthetic timestamp generation
+# ---------------------------------------------------------------------------
+
+
+def generate_synthetic_timestamps(documents, window_days=30):
+    """Generate synthetic created_at timestamps for temporal benchmarks."""
+    import datetime
+    import random
+
+    base_date = datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc)
+    timestamps = {}
+
+    # Build child-to-parent mapping for aggregate computation
+    id_to_doc = {doc["id"]: doc for doc in documents}
+
+    # Content/leaf gets random dates
+    for doc in documents:
+        if doc.get("tier") in ("content", "leaf"):
+            dt = base_date + datetime.timedelta(
+                days=random.uniform(0, window_days),
+                hours=random.uniform(0, 24),
+            )
+            timestamps[doc["id"]] = dt.isoformat()
+
+    # Stories/mid get median of children dates
+    for doc in documents:
+        if doc.get("tier") in ("story", "mid"):
+            child_ids = doc.get("child_ids", [])
+            child_times = sorted([timestamps[cid] for cid in child_ids if cid in timestamps])
+            if child_times:
+                timestamps[doc["id"]] = child_times[len(child_times) // 2]
+            else:
+                dt = base_date + datetime.timedelta(days=random.uniform(0, window_days))
+                timestamps[doc["id"]] = dt.isoformat()
+
+    # Narratives/root/theme get earliest of children
+    for doc in documents:
+        if doc.get("tier") in ("narrative", "root", "theme"):
+            child_ids = doc.get("child_ids", [])
+            child_times = [timestamps[cid] for cid in child_ids if cid in timestamps]
+            if child_times:
+                timestamps[doc["id"]] = min(child_times)
+            else:
+                dt = base_date + datetime.timedelta(days=random.uniform(0, window_days))
+                timestamps[doc["id"]] = dt.isoformat()
+
+    return [timestamps.get(doc["id"], base_date.isoformat()) for doc in documents]
+
+
+# ---------------------------------------------------------------------------
 # Tier centroid generation
 # ---------------------------------------------------------------------------
 
@@ -567,7 +642,7 @@ def create_unified_collection(
     size: int,
     curvature: float,
 ) -> None:
-    """Create a unified collection with cosine + poincare named vectors."""
+    """Create a unified collection with dense + poincare named vectors."""
     import requests
 
     url = f"{qdrant_url}/collections/{name}"
@@ -577,7 +652,7 @@ def create_unified_collection(
 
     body = {
         "vectors": {
-            "cosine": {
+            "dense": {
                 "size": size,
                 "distance": "Cosine",
                 "hnsw_config": {"m": 16, "ef_construct": 200},
@@ -593,7 +668,7 @@ def create_unified_collection(
 
     resp = requests.put(url, json=body)
     if resp.status_code == 200:
-        print(f"  Created unified collection '{name}' (cosine + poincare c={curvature})")
+        print(f"  Created unified collection '{name}' (dense + poincare c={curvature})")
         return
 
     # Retry without curvature if not supported
@@ -613,9 +688,12 @@ def upsert_unified(
     busemann_depths: np.ndarray,
     area_entries: list[dict],
     domain_entries: list[dict],
+    alpha_values: np.ndarray | None = None,
+    synthetic_timestamps: list[str] | None = None,
 ) -> None:
     """Upsert all three tiers into the unified collection."""
     from qdrant_client.models import PointStruct
+    from hyperbolic_math import alpha_precompute_batch
 
     # --- Content tier ---
     print(f"  Upserting {len(content_docs)} content points ...")
@@ -628,20 +706,38 @@ def upsert_unified(
         points = []
         for i in range(start, end):
             doc = content_docs[i]
+            poincare_vec = poincare_vectors[i]
+
+            # Alpha: use precomputed if available, else compute inline
+            if alpha_values is not None:
+                alpha_val = float(alpha_values[i])
+            else:
+                sq_norm = float(np.sum(poincare_vec ** 2))
+                alpha_val = 1.0 / max(1.0 - CURVATURE * sq_norm, 1e-7)
+
+            # Timestamp
+            ts = synthetic_timestamps[i] if synthetic_timestamps else None
+
             points.append(PointStruct(
                 id=CONTENT_ID_OFFSET + i,
                 vector={
-                    "cosine": cosine_vectors[i].tolist(),
+                    "dense": cosine_vectors[i].tolist(),
                     "poincare": poincare_vectors[i].tolist(),
                 },
                 payload={
                     "tier": "content",
+                    "item_type": "content",
+                    "point_id": doc["id"],
                     "busemann_depth": float(busemann_depths[i]),
                     "domain": doc["domain"],
                     "area": doc["area"],
                     "hierarchy_path": doc["hierarchy_path"],
                     "all_paths": doc.get("all_paths", [doc["hierarchy_path"]]),
                     "source_ids": [],
+                    "parent_ids": [f"area_{doc['area']}"],
+                    "child_ids": [],
+                    "alpha": alpha_val,
+                    "created_at": ts,
                 },
             ))
         client.upsert(collection_name=collection_name, points=points)
@@ -650,19 +746,47 @@ def upsert_unified(
     print(f"  Upserting {len(area_entries)} story points ...")
     story_points = []
     for entry in area_entries:
+        poincare_vec = entry["poincare"]
+        sq_norm = float(np.sum(poincare_vec ** 2))
+        alpha_val = 1.0 / max(1.0 - CURVATURE * sq_norm, 1e-7)
+
+        # Median timestamp of children
+        story_ts = None
+        if synthetic_timestamps:
+            child_times = sorted([
+                synthetic_timestamps[idx]
+                for idx in entry["source_ids"]
+                if idx < len(synthetic_timestamps) and synthetic_timestamps[idx]
+            ])
+            if child_times:
+                story_ts = child_times[len(child_times) // 2]
+
+        # Child IDs: the doc string IDs for content points in this area
+        child_point_ids = [
+            content_docs[idx]["id"]
+            for idx in entry["source_ids"]
+            if idx < len(content_docs)
+        ]
+
         story_points.append(PointStruct(
             id=entry["id"],
             vector={
-                "cosine": entry["cosine"].tolist(),
+                "dense": entry["cosine"].tolist(),
                 "poincare": entry["poincare"].tolist(),
             },
             payload={
                 "tier": "story",
+                "item_type": "story",
+                "point_id": f"area_{entry['area']}",
                 "busemann_depth": entry["busemann_depth"],
                 "domain": entry["domain"],
                 "area": entry["area"],
                 "hierarchy_path": entry["hierarchy_path"],
                 "source_ids": entry["source_ids"][:20],
+                "parent_ids": [f"domain_{entry['domain']}"],
+                "child_ids": child_point_ids,
+                "alpha": alpha_val,
+                "created_at": story_ts,
             },
         ))
     client.upsert(collection_name=collection_name, points=story_points)
@@ -671,19 +795,50 @@ def upsert_unified(
     print(f"  Upserting {len(domain_entries)} narrative points ...")
     narrative_points = []
     for entry in domain_entries:
+        poincare_vec = entry["poincare"]
+        sq_norm = float(np.sum(poincare_vec ** 2))
+        alpha_val = 1.0 / max(1.0 - CURVATURE * sq_norm, 1e-7)
+
+        # Earliest timestamp of children (area centroids)
+        narrative_ts = None
+        if synthetic_timestamps:
+            # entry["source_ids"] contains area centroid integer IDs;
+            # gather timestamps from content docs belonging to those areas
+            child_times = []
+            for ae in area_entries:
+                if ae["id"] in entry["source_ids"]:
+                    for idx in ae["source_ids"]:
+                        if idx < len(synthetic_timestamps) and synthetic_timestamps[idx]:
+                            child_times.append(synthetic_timestamps[idx])
+            if child_times:
+                narrative_ts = min(child_times)
+
+        # Child IDs: area centroid string IDs
+        child_area_ids = [
+            f"area_{ae['area']}"
+            for ae in area_entries
+            if ae["id"] in entry["source_ids"]
+        ]
+
         narrative_points.append(PointStruct(
             id=entry["id"],
             vector={
-                "cosine": entry["cosine"].tolist(),
+                "dense": entry["cosine"].tolist(),
                 "poincare": entry["poincare"].tolist(),
             },
             payload={
                 "tier": "narrative",
+                "item_type": "narrative",
+                "point_id": f"domain_{entry['domain']}",
                 "busemann_depth": entry["busemann_depth"],
                 "domain": entry["domain"],
                 "area": "",
                 "hierarchy_path": entry["hierarchy_path"],
                 "source_ids": entry["source_ids"],
+                "parent_ids": [],
+                "child_ids": child_area_ids,
+                "alpha": alpha_val,
+                "created_at": narrative_ts,
             },
         ))
     client.upsert(collection_name=collection_name, points=narrative_points)
@@ -741,6 +896,11 @@ def create_sweep_collection(
     client.create_payload_index(
         collection_name=coll_name,
         field_name="tier",
+        field_schema="keyword",
+    )
+    client.create_payload_index(
+        collection_name=coll_name,
+        field_name="item_type",
         field_schema="keyword",
     )
 
@@ -922,6 +1082,18 @@ def main() -> None:
     print(f"\n=== Step 5: Compute Busemann depths ===")
     busemann_depths, focal = compute_busemann(poincare_vectors, c=CURVATURE)
 
+    # Alpha precomputation
+    from hyperbolic_math import alpha_precompute_batch
+    alpha_values = alpha_precompute_batch(poincare_vectors, c=CURVATURE)
+    print(f"  Alpha values: min={alpha_values.min():.4f}, max={alpha_values.max():.4f}, mean={alpha_values.mean():.4f}")
+
+    # Gromov delta analysis
+    gromov_result = run_gromov_analysis(poincare_vectors, args.dataset)
+
+    # Synthetic timestamps
+    synthetic_timestamps = generate_synthetic_timestamps(docs)
+    print(f"  Generated {len(synthetic_timestamps)} synthetic timestamps")
+
     # ------------------------------------------------------------------
     # Step 6: Generate tier centroids
     # ------------------------------------------------------------------
@@ -958,6 +1130,8 @@ def main() -> None:
             client, UNIFIED_COLLECTION,
             docs, embeddings_128, poincare_vectors, busemann_depths,
             area_entries, domain_entries,
+            alpha_values=alpha_values,
+            synthetic_timestamps=synthetic_timestamps,
         )
 
         # Create payload indices for server-side filtering
@@ -972,7 +1146,12 @@ def main() -> None:
             field_name="tier",
             field_schema="keyword",
         )
-        print("  Created indices on 'busemann_depth' (float) and 'tier' (keyword)")
+        client.create_payload_index(
+            collection_name=UNIFIED_COLLECTION,
+            field_name="item_type",
+            field_schema="keyword",
+        )
+        print("  Created indices on 'busemann_depth' (float), 'tier' (keyword), 'item_type' (keyword)")
 
     if run_legacy:
         print(f"\n=== Step 7b: Legacy per-strategy collections ===")

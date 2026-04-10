@@ -315,6 +315,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             top,
             deleted_point_bitslice,
             vector_query_context.hardware_counter(),
+            None,
         )?;
         let hw_counter = vector_query_context.hardware_counter();
         let mut results = match filter {

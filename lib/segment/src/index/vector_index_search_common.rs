@@ -54,6 +54,7 @@ pub fn postprocess_search_result(
     params: Option<&SearchParams>,
     top: usize,
     hardware_counter: HardwareCounterCell,
+    curvature: Option<f32>,
 ) -> OperationResult<Vec<ScoredPointOffset>> {
     let quantization_enabled = is_quantized_search(quantized_vectors, params);
 
@@ -74,6 +75,7 @@ pub fn postprocess_search_result(
             None,
             point_deleted,
             hardware_counter,
+            curvature,
         )?;
 
         search_result = scorer

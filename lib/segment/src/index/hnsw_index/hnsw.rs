@@ -480,6 +480,7 @@ impl HNSWIndex {
                     None,
                     id_tracker_ref.deleted_point_bitslice(),
                     internal_hardware_counter,
+                    None,
                 )?;
 
                 graph_layers_builder.link_new_point(vector_id, points_scorer);
@@ -823,6 +824,7 @@ impl HNSWIndex {
                 Some(BoxCow::Borrowed(&block_condition_checker)),
                 id_tracker.deleted_point_bitslice(),
                 internal_hardware_counter,
+                None,
             )?;
 
             graph_layers_builder.link_new_point(block_point_id, points_scorer);
@@ -875,6 +877,7 @@ impl HNSWIndex {
                 None,
                 id_tracker.deleted_point_bitslice(),
                 hardware_counter,
+                None,
             )
         };
 
@@ -934,6 +937,7 @@ impl HNSWIndex {
                     Some(BoxCow::Owned(block_condition_checker)),
                     id_tracker.deleted_point_bitslice(),
                     hardware_counter,
+                    None,
                 )
             },
             stopped,
@@ -1109,6 +1113,7 @@ impl HNSWIndex {
                     .transpose()?,
                 deleted_points,
                 vector_query_context.hardware_counter(),
+                None,
             )?;
             let Some(link_scorer_filtered_bytes) = link_scorer_filtered.scorer_bytes() else {
                 return Ok(None);
@@ -1147,6 +1152,7 @@ impl HNSWIndex {
                 params,
                 vector_query_context.hardware_counter(),
                 filter_context,
+                None,
             )?;
 
             let search_result = self.graph.search(
@@ -1167,6 +1173,7 @@ impl HNSWIndex {
                 params,
                 top,
                 vector_query_context.hardware_counter(),
+                None,
             )
         };
 
@@ -1232,6 +1239,7 @@ impl HNSWIndex {
             params,
             vector_query_context.hardware_counter(),
             None,
+            None,
         )?;
         let mut search_results = batch_filtered_searcher.peek_top_iter(points, &is_stopped)?;
         for (search_result, query_vector) in search_results.iter_mut().zip(query_vectors) {
@@ -1244,6 +1252,7 @@ impl HNSWIndex {
                 params,
                 top,
                 vector_query_context.hardware_counter(),
+                None,
             )?;
         }
         Ok(search_results)
@@ -1352,6 +1361,7 @@ impl HNSWIndex {
         params: Option<&SearchParams>,
         hardware_counter: HardwareCounterCell,
         filter_context: Option<Box<dyn FilterContext + 'a>>,
+        curvature: Option<f32>,
     ) -> OperationResult<FilteredScorer<'a>> {
         let quantization_enabled = is_quantized_search(quantized_storage, params);
         FilteredScorer::new(
@@ -1361,6 +1371,7 @@ impl HNSWIndex {
             filter_context.map(BoxCow::Owned),
             deleted_points,
             hardware_counter,
+            curvature,
         )
     }
 
@@ -1374,6 +1385,7 @@ impl HNSWIndex {
         params: Option<&SearchParams>,
         hardware_counter: HardwareCounterCell,
         filter_context: Option<Box<dyn FilterContext + 'a>>,
+        curvature: Option<f32>,
     ) -> OperationResult<BatchFilteredSearcher<'a>> {
         let quantization_enabled = is_quantized_search(quantized_storage, params);
         BatchFilteredSearcher::new(
@@ -1384,6 +1396,7 @@ impl HNSWIndex {
             top,
             deleted_points,
             hardware_counter,
+            curvature,
         )
     }
 

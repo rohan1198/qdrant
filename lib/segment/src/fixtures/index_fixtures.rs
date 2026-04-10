@@ -92,6 +92,7 @@ impl TestRawScorerProducer {
             None,
             &self.deleted_points,
             HardwareCounterCell::new(),
+            None,
         )
         .unwrap()
     }
@@ -104,6 +105,7 @@ impl TestRawScorerProducer {
             None,
             &self.deleted_points,
             HardwareCounterCell::new(),
+            None,
         )
         .unwrap()
     }

@@ -2614,6 +2614,14 @@ impl TryFrom<Distance> for segment::types::Distance {
             Distance::Euclid => segment::types::Distance::Euclid,
             Distance::Dot => segment::types::Distance::Dot,
             Distance::Manhattan => segment::types::Distance::Manhattan,
+            #[cfg(feature = "hyperbolic")]
+            Distance::Poincare => segment::types::Distance::Poincare,
+            #[cfg(not(feature = "hyperbolic"))]
+            Distance::Poincare => {
+                return Err(Status::invalid_argument(
+                    "Poincare distance requires the 'hyperbolic' feature flag",
+                ));
+            }
         })
     }
 }
