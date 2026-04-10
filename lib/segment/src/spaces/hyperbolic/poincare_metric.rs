@@ -25,6 +25,33 @@ impl Metric<VectorElementType> for PoincareMetric {
     }
 
     fn similarity(v1: &[VectorElementType], v2: &[VectorElementType]) -> ScoreType {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx")
+                && is_x86_feature_detected!("fma")
+                && v1.len() >= 32
+            {
+                return unsafe {
+                    super::poincare_avx::poincare_similarity_avx(v1, v2, DEFAULT_CURVATURE)
+                };
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("sse") && v1.len() >= 16 {
+                return unsafe {
+                    super::poincare_sse::poincare_similarity_sse(v1, v2, DEFAULT_CURVATURE)
+                };
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") && v1.len() >= 16 {
+                return unsafe {
+                    super::poincare_neon::poincare_similarity_neon(v1, v2, DEFAULT_CURVATURE)
+                };
+            }
+        }
         -poincare_distance(v1, v2, DEFAULT_CURVATURE)
     }
 
@@ -69,6 +96,43 @@ impl Metric<VectorElementTypeHalf> for PoincareMetric {
     fn preprocess(vector: DenseVector) -> DenseVector {
         project_to_ball(vector, DEFAULT_CURVATURE)
     }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD-dispatched similarity with runtime curvature
+// ---------------------------------------------------------------------------
+
+/// SIMD-dispatched Poincaré similarity with runtime curvature.
+#[inline]
+fn poincare_similarity_dispatched(v1: &[f32], v2: &[f32], curvature: f32) -> ScoreType {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx")
+            && is_x86_feature_detected!("fma")
+            && v1.len() >= 32
+        {
+            return unsafe {
+                super::poincare_avx::poincare_similarity_avx(v1, v2, curvature)
+            };
+        }
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("sse") && v1.len() >= 16 {
+            return unsafe {
+                super::poincare_sse::poincare_similarity_sse(v1, v2, curvature)
+            };
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") && v1.len() >= 16 {
+            return unsafe {
+                super::poincare_neon::poincare_similarity_neon(v1, v2, curvature)
+            };
+        }
+    }
+    -poincare_distance(v1, v2, curvature)
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +189,7 @@ impl<TVectorStorage: DenseVectorStorage<VectorElementType>> QueryScorer
         self.hardware_counter.cpu_counter().incr();
         self.hardware_counter.vector_io_read().incr();
         let stored = self.vector_storage.get_dense::<Random>(idx);
-        -poincare_distance(&self.query, &stored, self.curvature)
+        poincare_similarity_dispatched(&self.query, &stored, self.curvature)
     }
 
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
@@ -137,21 +201,21 @@ impl<TVectorStorage: DenseVectorStorage<VectorElementType>> QueryScorer
 
         self.vector_storage
             .for_each_in_dense_batch(ids, |idx, vector| {
-                scores[idx] = -poincare_distance(&self.query, vector, self.curvature);
+                scores[idx] = poincare_similarity_dispatched(&self.query, vector, self.curvature);
             });
     }
 
     #[inline]
     fn score(&self, v2: &[VectorElementType]) -> ScoreType {
         self.hardware_counter.cpu_counter().incr();
-        -poincare_distance(&self.query, v2, self.curvature)
+        poincare_similarity_dispatched(&self.query, v2, self.curvature)
     }
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
         self.hardware_counter.cpu_counter().incr();
         let v1 = self.vector_storage.get_dense::<Random>(point_a);
         let v2 = self.vector_storage.get_dense::<Random>(point_b);
-        -poincare_distance(&v1, &v2, self.curvature)
+        poincare_similarity_dispatched(&v1, &v2, self.curvature)
     }
 
     type SupportsBytes = True;

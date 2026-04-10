@@ -17,7 +17,7 @@ pub(crate) const EPS: f32 = 1e-5;
 
 /// Compute `||u - v||^2`, `||u||^2` and `||v||^2` in a single pass over both
 /// slices (avoids three separate iterations).
-fn fused_norms(u: &[f32], v: &[f32]) -> (f32, f32, f32) {
+pub(crate) fn fused_norms(u: &[f32], v: &[f32]) -> (f32, f32, f32) {
     debug_assert_eq!(u.len(), v.len(), "dimension mismatch");
     let mut diff_sq: f32 = 0.0;
     let mut u_sq: f32 = 0.0;
@@ -35,7 +35,7 @@ fn fused_norms(u: &[f32], v: &[f32]) -> (f32, f32, f32) {
 ///
 /// Near `x = 1` the standard `f32::acosh` can lose precision, so we use a
 /// first-order Taylor expansion: `acosh(1 + δ) ≈ sqrt(2δ)` for small δ.
-fn stable_acosh(x: f32) -> f32 {
+pub(crate) fn stable_acosh(x: f32) -> f32 {
     if x <= 1.0 {
         return 0.0;
     }
