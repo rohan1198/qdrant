@@ -262,3 +262,111 @@ def poincare_distance_with_alpha(diff_sq, alpha_u, alpha_v, c=1.0):
     sqrt_c = np.sqrt(c)
     arg = 1.0 + 2.0 * c * diff_sq * alpha_u * alpha_v
     return (1.0 / sqrt_c) * np.arccosh(np.clip(arg, 1.0, None))
+
+
+# ---------------------------------------------------------------------------
+# Klein disk model
+# ---------------------------------------------------------------------------
+
+def poincare_to_klein(vector, c=1.0):
+    """Convert Poincaré ball point to Klein disk coordinates.
+
+    Klein geodesics are Euclidean straight lines (chords), making
+    Klein-space distance a cheap L2 proxy for Poincaré distance.
+
+    k_i = 2 * p_i / (1 + c * ||p||^2)
+
+    Source: HyperspaceDB vector.rs
+    """
+    sq_norm = np.dot(vector, vector)
+    return 2.0 * vector / (1.0 + c * sq_norm)
+
+
+def poincare_to_klein_batch(vectors, c=1.0):
+    """Batch Klein conversion for a matrix of vectors."""
+    sq_norms = np.sum(vectors ** 2, axis=1, keepdims=True)
+    return 2.0 * vectors / (1.0 + c * sq_norms)
+
+
+def klein_chord_distance_sq(u_klein, v_klein):
+    """Squared Euclidean distance in Klein disk (chord distance).
+
+    This is a fast proxy for Poincaré distance — no acosh needed.
+    Preserves ordering for nearby points.
+    """
+    diff = u_klein - v_klein
+    return np.dot(diff, diff)
+
+
+# ---------------------------------------------------------------------------
+# Geometric filters (client-side post-filtering)
+# ---------------------------------------------------------------------------
+
+def inball_filter(candidates, center, radius, curvature=1.0):
+    """Keep candidates within Poincaré distance `radius` of `center`.
+
+    Args:
+        candidates: list of dicts with 'vector' key (Poincaré coordinates)
+        center: np.ndarray, center point in Poincaré ball
+        radius: float, maximum Poincaré distance from center
+        curvature: float, ball curvature
+
+    Returns:
+        Filtered list of candidates
+    """
+    center_sq = np.dot(center, center)
+    alpha_c = 1.0 / max(1.0 - curvature * center_sq, 1e-7)
+    sqrt_c = np.sqrt(curvature)
+
+    result = []
+    for cand in candidates:
+        v = cand["vector"]
+        diff = center - v
+        diff_sq = np.dot(diff, diff)
+        v_sq = np.dot(v, v)
+        alpha_v = 1.0 / max(1.0 - curvature * v_sq, 1e-7)
+        arg = 1.0 + 2.0 * curvature * diff_sq * alpha_c * alpha_v
+        dist = np.arccosh(max(arg, 1.0)) / sqrt_c
+        if dist <= radius:
+            result.append(cand)
+    return result
+
+
+def incone_filter(candidates, axis, aperture, origin=None):
+    """Keep candidates within angular aperture of axis direction from origin.
+
+    Measures the angle between the direction from origin to each candidate
+    and the axis direction. Keeps candidates within the aperture.
+
+    Args:
+        candidates: list of dicts with 'vector' key
+        axis: np.ndarray, direction vector (will be normalized)
+        aperture: float, half-angle in radians
+        origin: np.ndarray or None (defaults to zero vector)
+
+    Returns:
+        Filtered list of candidates
+    """
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-10:
+        return candidates
+
+    axis_unit = axis / axis_norm
+
+    result = []
+    for cand in candidates:
+        v = cand["vector"]
+        if origin is not None:
+            v = v - origin
+
+        v_norm = np.linalg.norm(v)
+        if v_norm < 1e-10:
+            continue
+
+        cos_angle = np.dot(v / v_norm, axis_unit)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle = np.arccos(cos_angle)
+
+        if angle <= aperture:
+            result.append(cand)
+    return result

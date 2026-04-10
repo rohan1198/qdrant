@@ -30,6 +30,8 @@ from hyperbolic_math import (
     busemann_depth_single,
     compute_focal_direction,
     einstein_midpoint,
+    poincare_to_klein_batch,
+    poincare_to_klein,
 )
 
 # ---------------------------------------------------------------------------
@@ -690,6 +692,7 @@ def upsert_unified(
     domain_entries: list[dict],
     alpha_values: np.ndarray | None = None,
     synthetic_timestamps: list[str] | None = None,
+    klein_vectors: np.ndarray | None = None,
 ) -> None:
     """Upsert all three tiers into the unified collection."""
     from qdrant_client.models import PointStruct
@@ -738,6 +741,7 @@ def upsert_unified(
                     "child_ids": [],
                     "alpha": alpha_val,
                     "created_at": ts,
+                    "klein_vector": klein_vectors[i].tolist() if klein_vectors is not None else None,
                 },
             ))
         client.upsert(collection_name=collection_name, points=points)
@@ -787,6 +791,7 @@ def upsert_unified(
                 "child_ids": child_point_ids,
                 "alpha": alpha_val,
                 "created_at": story_ts,
+                "klein_vector": poincare_to_klein(entry["poincare"], c=CURVATURE).tolist(),
             },
         ))
     client.upsert(collection_name=collection_name, points=story_points)
@@ -839,6 +844,7 @@ def upsert_unified(
                 "child_ids": child_area_ids,
                 "alpha": alpha_val,
                 "created_at": narrative_ts,
+                "klein_vector": poincare_to_klein(entry["poincare"], c=CURVATURE).tolist(),
             },
         ))
     client.upsert(collection_name=collection_name, points=narrative_points)
@@ -1087,6 +1093,10 @@ def main() -> None:
     alpha_values = alpha_precompute_batch(poincare_vectors, c=CURVATURE)
     print(f"  Alpha values: min={alpha_values.min():.4f}, max={alpha_values.max():.4f}, mean={alpha_values.mean():.4f}")
 
+    # Klein vector precomputation
+    klein_vectors = poincare_to_klein_batch(poincare_vectors, c=CURVATURE)
+    print(f"  Klein vectors: shape={klein_vectors.shape}")
+
     # Gromov delta analysis
     gromov_result = run_gromov_analysis(poincare_vectors, args.dataset)
 
@@ -1132,6 +1142,7 @@ def main() -> None:
             area_entries, domain_entries,
             alpha_values=alpha_values,
             synthetic_timestamps=synthetic_timestamps,
+            klein_vectors=klein_vectors,
         )
 
         # Create payload indices for server-side filtering

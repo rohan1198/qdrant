@@ -10,6 +10,8 @@ mod fixtures;
 #[cfg(feature = "gpu")]
 mod gpu_hnsw_test;
 mod hnsw_discover_test;
+#[cfg(feature = "hyperbolic")]
+mod hnsw_poincare_search_test;
 mod hnsw_incremental_build;
 mod hnsw_quantized_search_test;
 mod multivector_filtrable_hnsw_test;

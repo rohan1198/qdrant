@@ -372,3 +372,147 @@ def depth_band_query(client, collection, query_vector, depth_min, depth_max, usi
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def klein_prefilter_query(client, collection, query_poincare, curvature=5.0,
+                          prefetch_limit=200, klein_top=50, final_top=10,
+                          using_prefetch="dense", ef=128):
+    """Three-stage search: cosine prefetch → Klein pre-rank → Poincaré re-rank.
+
+    Stage 1: Fast HNSW search using cosine named vector (server-side)
+    Stage 2: Re-rank candidates by Klein chord distance (client-side, cheap)
+    Stage 3: Re-rank survivors by exact Poincaré distance (client-side, expensive)
+    """
+    import numpy as np
+    from hyperbolic_math import (poincare_to_klein, klein_chord_distance_sq,
+                                  poincare_distance_with_alpha, alpha_precompute, fused_norms)
+    try:
+        t0 = time.time()
+
+        # Convert query for prefetch
+        query_list = query_poincare.tolist() if hasattr(query_poincare, "tolist") else list(query_poincare)
+
+        # Stage 1: Cosine prefetch from Qdrant
+        prefetch_results = client.query_points(
+            collection_name=collection,
+            query=query_list,
+            using=using_prefetch,
+            limit=prefetch_limit,
+            search_params=SearchParams(hnsw_ef=ef),
+            with_payload=True,
+            with_vectors=True,
+        ).points
+        t1 = time.time()
+
+        # Stage 2: Klein pre-rank
+        query_klein = poincare_to_klein(np.array(query_poincare), c=curvature)
+        scored = []
+        for r in prefetch_results:
+            vec = r.vector
+            if isinstance(vec, dict):
+                vec = vec.get("poincare", next(iter(vec.values())))
+            if vec is None:
+                continue
+            poincare_vec = np.array(vec, dtype=np.float32)
+            klein_vec = poincare_to_klein(poincare_vec, c=curvature)
+            klein_dist = klein_chord_distance_sq(query_klein, klein_vec)
+            scored.append((r, klein_dist, poincare_vec))
+        scored.sort(key=lambda x: x[1])
+        klein_survivors = scored[:klein_top]
+        t2 = time.time()
+
+        # Stage 3: Poincaré re-rank
+        query_np = np.array(query_poincare, dtype=np.float32)
+        query_alpha = alpha_precompute(query_np, c=curvature)
+        poincare_scored = []
+        for r, _, poincare_vec in klein_survivors:
+            diff_sq, _, _ = fused_norms(query_np, poincare_vec)
+            cand_alpha = alpha_precompute(poincare_vec, c=curvature)
+            dist = poincare_distance_with_alpha(diff_sq, query_alpha, cand_alpha, c=curvature)
+            poincare_scored.append((r, float(dist)))
+        poincare_scored.sort(key=lambda x: x[1])
+        final_results = poincare_scored[:final_top]
+        t3 = time.time()
+
+        return {
+            "results": [r for r, _ in final_results],
+            "distances": [d for _, d in final_results],
+            "prefetch_count": len(prefetch_results),
+            "klein_survivors": len(klein_survivors),
+            "final_count": len(final_results),
+            "stage1_latency_ms": (t1 - t0) * 1000,
+            "stage2_latency_ms": (t2 - t1) * 1000,
+            "stage3_latency_ms": (t3 - t2) * 1000,
+            "total_latency_ms": (t3 - t0) * 1000,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def geometric_filtered_query(client, collection, query_vector, filters,
+                              using="poincare", limit=200, final_top=10, ef=128,
+                              curvature=5.0):
+    """Search Qdrant, then apply geometric filters client-side.
+
+    Args:
+        filters: list of filter specs, each a dict:
+            {"type": "inball", "center": ndarray, "radius": float}
+            {"type": "incone", "axis": ndarray, "aperture": float}
+            {"type": "depth_band", "depth_min": float, "depth_max": float}
+    Filters compose with AND logic.
+    """
+    import numpy as np
+    from hyperbolic_math import inball_filter, incone_filter
+
+    try:
+        t0 = time.time()
+        query_list = query_vector.tolist() if hasattr(query_vector, "tolist") else list(query_vector)
+
+        results = client.query_points(
+            collection_name=collection,
+            query=query_list,
+            using=using,
+            limit=limit,
+            search_params=SearchParams(hnsw_ef=ef),
+            with_payload=True,
+            with_vectors=True,
+        ).points
+        t1 = time.time()
+
+        # Convert to candidate dicts
+        candidates = []
+        for r in results:
+            vec = r.vector
+            if isinstance(vec, dict):
+                vec = vec.get("poincare", vec.get("dense", next(iter(vec.values()))))
+            candidates.append({
+                "vector": np.array(vec, dtype=np.float32),
+                "point": r,
+                "busemann_depth": r.payload.get("busemann_depth", 0),
+            })
+
+        # Apply filters (AND logic)
+        filtered = candidates
+        for f in filters:
+            if f["type"] == "inball":
+                filtered = inball_filter(filtered, f["center"], f["radius"], curvature)
+            elif f["type"] == "incone":
+                filtered = incone_filter(filtered, f["axis"], f["aperture"], f.get("origin"))
+            elif f["type"] == "depth_band":
+                filtered = [c for c in filtered
+                           if f["depth_min"] <= c["busemann_depth"] <= f["depth_max"]]
+
+        t2 = time.time()
+        final = filtered[:final_top]
+
+        return {
+            "results": [c["point"] for c in final],
+            "initial_count": len(candidates),
+            "filtered_count": len(filtered),
+            "final_count": len(final),
+            "search_latency_ms": (t1 - t0) * 1000,
+            "filter_latency_ms": (t2 - t1) * 1000,
+            "total_latency_ms": (t2 - t0) * 1000,
+        }
+    except Exception as e:
+        return {"error": str(e)}

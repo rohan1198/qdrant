@@ -1,6 +1,15 @@
 pub mod poincare_math;
 pub mod poincare_metric;
 
+#[cfg(target_arch = "x86_64")]
+pub mod poincare_avx;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub mod poincare_sse;
+
+#[cfg(target_arch = "aarch64")]
+pub mod poincare_neon;
+
 // Re-export key types for convenience
 pub use poincare_metric::PoincareMetric;
 pub use poincare_metric::PoincareCurvatureQueryScorer;

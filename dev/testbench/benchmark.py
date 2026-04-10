@@ -1,6 +1,6 @@
 """Benchmark script for hyperbolic (Poincare / Busemann) vector collections in Qdrant.
 
-Runs 8 benchmark suites via BenchmarkRunner:
+Runs 11 benchmark suites via BenchmarkRunner:
   1. Gromov Delta          — 4-point hyperbolicity measure
   2. Hierarchy Separation  — Busemann depth per tier + band overlap + Einstein midpoints
   3. Drill-Down Queries    — vertical traversal recall (chatbot pattern)
@@ -9,6 +9,9 @@ Runs 8 benchmark suites via BenchmarkRunner:
   6. Depth-Band Filtering  — Busemann depth-filtered search precision
   7. Unified vs Separate   — compare unified and per-tier collections
   8. Latency               — throughput and p50/p95/p99 at multiple ef values
+  9. Quantization Recall   — recall of quantized vs exact Poincaré search
+ 10. Klein Pre-Filter      — Klein pre-filter pipeline vs direct Poincaré search
+ 11. Geometric Filters     — geometric filter precision and selectivity
 
 Auto-discovers dataset collections and adapts to whatever exists.
 
@@ -27,6 +30,7 @@ from pathlib import Path
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import SearchParams
+from tqdm import tqdm
 
 from fusion import rrf_fuse
 from hyperbolic_math import (
@@ -1068,7 +1072,7 @@ def print_comparison_table(
 
 
 class BenchmarkRunner:
-    """Unified benchmark engine with 8 suites.
+    """Unified benchmark engine with 11 suites.
 
     Suites:
       1. gromov_delta          — 4-point hyperbolicity measure
@@ -1079,6 +1083,9 @@ class BenchmarkRunner:
       6. depth_band            — Busemann depth-filtered search precision
       7. unified_vs_separate   — compare unified and per-tier collections
       8. latency               — throughput and p50/p95/p99
+      9. quantization_recall   — recall of quantized vs exact Poincaré search
+     10. klein_prefilter       — Klein pre-filter pipeline vs direct Poincaré
+     11. geometric_filters     — geometric filter precision and selectivity
     """
 
     def __init__(self, client: QdrantClient, qdrant_url: str, dataset: str, curvature: float = 5.0):
@@ -1133,7 +1140,7 @@ class BenchmarkRunner:
     # ------------------------------------------------------------------
 
     def run_all(self) -> dict:
-        """Run all 8 benchmark suites in order."""
+        """Run all 11 benchmark suites in order."""
         print(f"\n{'='*60}")
         print(f"Benchmarking dataset: {self.dataset}")
         print(f"Curvature: {self.curvature}")
@@ -1147,6 +1154,9 @@ class BenchmarkRunner:
         self.suite_depth_band()
         self.suite_unified_vs_separate()
         self.suite_latency()
+        self.suite_quantization_recall()
+        self.suite_klein_prefilter()
+        self.suite_geometric_filters()
 
         return self.results
 
@@ -1871,6 +1881,188 @@ class BenchmarkRunner:
 
         return self.results["latency"]
 
+    # ------------------------------------------------------------------
+    # Suite 9: Quantization Recall
+    # ------------------------------------------------------------------
+
+    def suite_quantization_recall(self):
+        """Measure recall of quantized vs exact Poincaré search."""
+        print(f"\n--- Suite 9: Quantization Recall ---")
+        try:
+            points = self._load_unified_points()
+            sample = random.sample(points, min(200, len(points)))
+            recalls = []
+
+            for pt in tqdm(sample, desc="  quantization recall"):
+                vec = pt.get("vectors", {}).get("poincare", pt["vector"])
+                if hasattr(vec, "tolist"):
+                    vec = vec.tolist()
+
+                try:
+                    quantized = self.client.query_points(
+                        collection_name=self.unified_collection,
+                        query=vec, using="poincare", limit=10,
+                        search_params=SearchParams(hnsw_ef=128),
+                        with_payload=False,
+                    ).points
+                except Exception:
+                    continue
+
+                try:
+                    exact = self.client.query_points(
+                        collection_name=self.unified_collection,
+                        query=vec, using="poincare", limit=10,
+                        search_params=SearchParams(hnsw_ef=128, exact=True),
+                        with_payload=False,
+                    ).points
+                except Exception:
+                    continue
+
+                q_ids = {r.id for r in quantized}
+                e_ids = {r.id for r in exact}
+                if e_ids:
+                    recalls.append(len(q_ids & e_ids) / len(e_ids))
+
+            result = {
+                "recall_at_10": float(np.mean(recalls)) if recalls else None,
+                "recall_min": float(np.min(recalls)) if recalls else None,
+                "recall_max": float(np.max(recalls)) if recalls else None,
+                "num_queries": len(recalls),
+            }
+            self.results["quantization_recall"] = result
+            if recalls:
+                print(f"  recall@10: {np.mean(recalls):.4f} (min={np.min(recalls):.4f}, max={np.max(recalls):.4f})")
+            else:
+                print("  No valid recall measurements")
+        except Exception as e:
+            self.results["quantization_recall"] = {"error": str(e)}
+            print(f"  ERROR: {e}")
+
+    # ------------------------------------------------------------------
+    # Suite 10: Klein Pre-Filter
+    # ------------------------------------------------------------------
+
+    def suite_klein_prefilter(self):
+        """Compare Klein pre-filter pipeline vs direct Poincaré search."""
+        print(f"\n--- Suite 10: Klein Pre-Filter ---")
+        try:
+            from queries import klein_prefilter_query
+            points = self._load_unified_points()
+            sample = random.sample(points, min(100, len(points)))
+
+            klein_latencies = []
+            recall_vs_direct = []
+
+            for pt in tqdm(sample, desc="  klein prefilter"):
+                poincare_vec = pt.get("vectors", {}).get("poincare", pt["vector"])
+
+                # Direct Poincaré search baseline
+                try:
+                    vec_list = poincare_vec.tolist() if hasattr(poincare_vec, "tolist") else poincare_vec
+                    direct = self.client.query_points(
+                        collection_name=self.unified_collection,
+                        query=vec_list, using="poincare", limit=10,
+                        search_params=SearchParams(hnsw_ef=128),
+                        with_payload=False,
+                    ).points
+                    direct_ids = {r.id for r in direct}
+                except Exception:
+                    continue
+
+                # Klein pre-filter pipeline
+                result = klein_prefilter_query(
+                    self.client, self.unified_collection,
+                    poincare_vec, curvature=self.curvature,
+                    prefetch_limit=200, klein_top=50, final_top=10,
+                )
+                if "error" in result:
+                    continue
+
+                klein_ids = {r.id for r in result["results"]}
+                if direct_ids:
+                    recall_vs_direct.append(len(klein_ids & direct_ids) / len(direct_ids))
+                klein_latencies.append(result["total_latency_ms"])
+
+            self.results["klein_prefilter"] = {
+                "recall_vs_direct": float(np.mean(recall_vs_direct)) if recall_vs_direct else None,
+                "avg_klein_latency_ms": float(np.mean(klein_latencies)) if klein_latencies else None,
+                "num_queries": len(recall_vs_direct),
+            }
+            if recall_vs_direct:
+                print(f"  recall vs direct: {np.mean(recall_vs_direct):.4f}")
+                print(f"  avg Klein latency: {np.mean(klein_latencies):.1f}ms")
+            else:
+                print("  No valid measurements")
+        except Exception as e:
+            self.results["klein_prefilter"] = {"error": str(e)}
+            print(f"  ERROR: {e}")
+
+    # ------------------------------------------------------------------
+    # Suite 11: Geometric Filters
+    # ------------------------------------------------------------------
+
+    def suite_geometric_filters(self):
+        """Validate geometric filter precision and selectivity."""
+        print(f"\n--- Suite 11: Geometric Filters ---")
+        try:
+            from queries import geometric_filtered_query
+            points = self._load_unified_points()
+            content_points = [p for p in points if p.get("item_type", p.get("tier")) == "content"]
+            sample = random.sample(content_points, min(100, len(content_points)))
+
+            # Test InBall
+            inball_selectivities = []
+            for pt in tqdm(sample[:50], desc="  inball"):
+                result = geometric_filtered_query(
+                    self.client, self.unified_collection, pt["vector"],
+                    filters=[{"type": "inball", "center": pt["vector"], "radius": 1.5}],
+                    using="poincare", limit=100, final_top=50, curvature=self.curvature,
+                )
+                if "error" not in result and result["initial_count"] > 0:
+                    inball_selectivities.append(result["filtered_count"] / result["initial_count"])
+
+            # Test InCone
+            incone_selectivities = []
+            for pt in tqdm(sample[:50], desc="  incone"):
+                result = geometric_filtered_query(
+                    self.client, self.unified_collection, pt["vector"],
+                    filters=[{"type": "incone", "axis": pt["vector"], "aperture": 0.5}],
+                    using="poincare", limit=100, final_top=50, curvature=self.curvature,
+                )
+                if "error" not in result and result["initial_count"] > 0:
+                    incone_selectivities.append(result["filtered_count"] / result["initial_count"])
+
+            # Test composition: InBall + DepthBand
+            composed_selectivities = []
+            for pt in tqdm(sample[:50], desc="  composed"):
+                depth = pt.get("busemann_depth", 1.0)
+                result = geometric_filtered_query(
+                    self.client, self.unified_collection, pt["vector"],
+                    filters=[
+                        {"type": "inball", "center": pt["vector"], "radius": 2.0},
+                        {"type": "depth_band", "depth_min": depth - 0.2, "depth_max": depth + 0.2},
+                    ],
+                    using="poincare", limit=100, final_top=50, curvature=self.curvature,
+                )
+                if "error" not in result and result["initial_count"] > 0:
+                    composed_selectivities.append(result["filtered_count"] / result["initial_count"])
+
+            self.results["geometric_filters"] = {
+                "inball_selectivity": float(np.mean(inball_selectivities)) if inball_selectivities else None,
+                "incone_selectivity": float(np.mean(incone_selectivities)) if incone_selectivities else None,
+                "composed_selectivity": float(np.mean(composed_selectivities)) if composed_selectivities else None,
+                "num_queries": len(inball_selectivities),
+            }
+            if inball_selectivities:
+                print(f"  inball selectivity: {np.mean(inball_selectivities):.4f}")
+            if incone_selectivities:
+                print(f"  incone selectivity: {np.mean(incone_selectivities):.4f}")
+            if composed_selectivities:
+                print(f"  composed selectivity: {np.mean(composed_selectivities):.4f}")
+        except Exception as e:
+            self.results["geometric_filters"] = {"error": str(e)}
+            print(f"  ERROR: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1898,7 +2090,8 @@ def main() -> None:
         default=None,
         help="Run specific suites (default: all). "
              "Options: gromov_delta, hierarchy_separation, drill_down, lateral, "
-             "cross_branch, depth_band, unified_vs_separate, latency",
+             "cross_branch, depth_band, unified_vs_separate, latency, "
+             "quantization_recall, klein_prefilter, geometric_filters",
     )
     parser.add_argument(
         "--curvature",
@@ -1923,7 +2116,8 @@ def main() -> None:
             else:
                 print(f"Unknown suite: {suite_name}")
                 print("  Available: gromov_delta, hierarchy_separation, drill_down, "
-                      "lateral, cross_branch, depth_band, unified_vs_separate, latency")
+                      "lateral, cross_branch, depth_band, unified_vs_separate, latency, "
+                      "quantization_recall, klein_prefilter, geometric_filters")
     else:
         runner.run_all()
 
