@@ -252,6 +252,7 @@ fn do_test_score_points(storage: &mut VectorStorageEnum) {
         None,
         id_tracker.deleted_point_bitslice(),
         HardwareCounterCell::new(),
+        None,
     )
     .unwrap();
 
@@ -263,6 +264,7 @@ fn do_test_score_points(storage: &mut VectorStorageEnum) {
         2,
         id_tracker.deleted_point_bitslice(),
         HardwareCounterCell::new(),
+        None,
     )
     .unwrap();
     let closest = searcher

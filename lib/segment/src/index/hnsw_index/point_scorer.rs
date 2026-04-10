@@ -18,6 +18,8 @@ use crate::vector_storage::query_scorer::QueryScorerBytes;
 use crate::vector_storage::{
     RawScorer, VectorStorage, VectorStorageEnum, check_deleted_condition, new_raw_scorer,
 };
+#[cfg(feature = "hyperbolic")]
+use crate::vector_storage::raw_scorer::new_raw_scorer_with_curvature;
 
 /// Scorers composition:
 ///
@@ -122,10 +124,25 @@ impl<'a> FilteredScorer<'a> {
         filter_context: Option<BoxCow<'a, dyn FilterContext + 'a>>,
         point_deleted: &'a BitSlice,
         hardware_counter: HardwareCounterCell,
+        curvature: Option<f32>,
     ) -> OperationResult<Self> {
         let raw_scorer = match quantized_vectors {
             Some(quantized_vectors) => quantized_vectors.raw_scorer(query, hardware_counter)?,
-            None => new_raw_scorer(query, vectors, hardware_counter)?,
+            None => {
+                #[cfg(feature = "hyperbolic")]
+                {
+                    if let Some(c) = curvature {
+                        new_raw_scorer_with_curvature(query, vectors, hardware_counter, c)?
+                    } else {
+                        new_raw_scorer(query, vectors, hardware_counter)?
+                    }
+                }
+                #[cfg(not(feature = "hyperbolic"))]
+                {
+                    let _ = curvature;
+                    new_raw_scorer(query, vectors, hardware_counter)?
+                }
+            }
         };
         Ok(FilteredScorer {
             raw_scorer,
@@ -145,6 +162,7 @@ impl<'a> FilteredScorer<'a> {
         filter_context: Option<BoxCow<'a, dyn FilterContext + 'a>>,
         point_deleted: &'a BitSlice,
         hardware_counter: HardwareCounterCell,
+        curvature: Option<f32>,
     ) -> OperationResult<Self> {
         // This is a fallback function, which is used if quantized vector storage
         // is not capable of reconstructing the query vector.
@@ -161,7 +179,19 @@ impl<'a> FilteredScorer<'a> {
                 })?,
             None => {
                 let query = original_query_fn();
-                new_raw_scorer(query, vectors, hardware_counter)?
+                #[cfg(feature = "hyperbolic")]
+                {
+                    if let Some(c) = curvature {
+                        new_raw_scorer_with_curvature(query, vectors, hardware_counter, c)?
+                    } else {
+                        new_raw_scorer(query, vectors, hardware_counter)?
+                    }
+                }
+                #[cfg(not(feature = "hyperbolic"))]
+                {
+                    let _ = curvature;
+                    new_raw_scorer(query, vectors, hardware_counter)?
+                }
             }
         };
         Ok(FilteredScorer {
@@ -283,6 +313,7 @@ impl<'a> BatchFilteredSearcher<'a> {
         top: usize,
         point_deleted: &'a BitSlice,
         hardware_counter: HardwareCounterCell,
+        curvature: Option<f32>,
     ) -> OperationResult<Self> {
         let scorer_batch = queries
             .iter()
@@ -293,7 +324,21 @@ impl<'a> BatchFilteredSearcher<'a> {
                     Some(quantized_vectors) => {
                         quantized_vectors.raw_scorer(query, hardware_counter)
                     }
-                    None => new_raw_scorer(query, vectors, hardware_counter),
+                    None => {
+                        #[cfg(feature = "hyperbolic")]
+                        {
+                            if let Some(c) = curvature {
+                                new_raw_scorer_with_curvature(query, vectors, hardware_counter, c)
+                            } else {
+                                new_raw_scorer(query, vectors, hardware_counter)
+                            }
+                        }
+                        #[cfg(not(feature = "hyperbolic"))]
+                        {
+                            let _ = curvature;
+                            new_raw_scorer(query, vectors, hardware_counter)
+                        }
+                    }
                 };
                 let pq = FixedLengthPriorityQueue::new(top);
                 raw_scorer.map(|raw_scorer| BatchSearch { raw_scorer, pq })

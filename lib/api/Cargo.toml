@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 tracing = ["dep:tracing", "segment/tracing"]
+hyperbolic = ["segment/hyperbolic"]
 
 [dependencies]
 ahash = { workspace = true }

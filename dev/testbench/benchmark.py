@@ -1,22 +1,27 @@
 """Benchmark script for hyperbolic (Poincare / Busemann) vector collections in Qdrant.
 
-Runs 4 benchmark suites:
-  1. Hierarchy Separation  — Busemann depth per tier + band overlap
-  2. Retrieval Quality     — recall@10 within hierarchy
-  3. Curvature Comparison  — summary table (printed after 1, 2, 4)
-  4. Performance & Latency — throughput and p50/p95/p99
+Runs 8 benchmark suites via BenchmarkRunner:
+  1. Gromov Delta          — 4-point hyperbolicity measure
+  2. Hierarchy Separation  — Busemann depth per tier + band overlap + Einstein midpoints
+  3. Drill-Down Queries    — vertical traversal recall (chatbot pattern)
+  4. Lateral Exploration   — horizontal same-tier search quality (chatbot pattern)
+  5. Cross-Branch Discovery— structural similarity across domains (chatbot pattern)
+  6. Depth-Band Filtering  — Busemann depth-filtered search precision
+  7. Unified vs Separate   — compare unified and per-tier collections
+  8. Latency               — throughput and p50/p95/p99 at multiple ef values
 
-Auto-discovers wos_* collections and adapts to whatever exists.
+Auto-discovers dataset collections and adapts to whatever exists.
 
 Usage:
-  python benchmark.py [--qdrant-url http://localhost:6334]
+  python benchmark.py [--qdrant-url http://localhost:6334] [--dataset bgc]
+  python benchmark.py --suites gromov_delta hierarchy_separation latency
 """
 
 import argparse
+import datetime
 import json
 import random
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +34,14 @@ from hyperbolic_math import (
     busemann_depth_single,
     compute_busemann_depths,
     compute_focal_direction,
+    einstein_midpoint,
+    gromov_delta,
+)
+from queries import (
+    cross_branch_query,
+    depth_band_query,
+    drill_down_query,
+    lateral_query,
 )
 
 # ---------------------------------------------------------------------------
@@ -224,7 +237,7 @@ def scroll_all(
 ) -> list[dict]:
     """Scroll all points from a collection, returning list of dicts.
 
-    For unified collections, specify vector_name ('cosine' or 'poincare')
+    For unified collections, specify vector_name ('dense' or 'poincare')
     to extract that named vector into 'vector'. If None, extracts the first/only vector.
 
     When with_vectors=True returns a dict of named vectors, ALL named vectors
@@ -257,11 +270,15 @@ def scroll_all(
                 "id": pt.id,
                 "vector": np.array(raw_vec, dtype=np.float32),
                 "tier": pt.payload.get("tier", "leaf"),
+                "item_type": pt.payload.get("item_type", pt.payload.get("tier", "content")),
                 "domain": pt.payload.get("domain", -1),
                 "area": pt.payload.get("area", -1),
                 "busemann_depth": pt.payload.get("busemann_depth"),
                 "all_paths": pt.payload.get("all_paths", []),
                 "hierarchy_path": pt.payload.get("hierarchy_path", ""),
+                "point_id": pt.payload.get("point_id", str(pt.id)),
+                "parent_ids": pt.payload.get("parent_ids", []),
+                "child_ids": pt.payload.get("child_ids", pt.payload.get("source_ids", [])),
             }
             if all_vectors is not None:
                 entry["vectors"] = all_vectors
@@ -640,7 +657,7 @@ def benchmark_retrieval_modes(
         "unfiltered": ("poincare", lambda q: _search_named(client, collection, "poincare", q, limit=k + 1)),
         "tier_filtered": ("poincare", lambda q: _search_named(client, collection, "poincare", q, limit=k + 1, tier_filter="content")),
         "depth_range": ("poincare", lambda q: _search_named_depth_range(client, collection, "poincare", q, limit=k + 1, depth_lo=depth_lo, depth_hi=depth_hi)),
-        "cosine_tier_filtered": ("cosine", lambda q: _search_named(client, collection, "cosine", q, limit=k + 1, tier_filter="content")),
+        "cosine_tier_filtered": ("dense", lambda q: _search_named(client, collection, "dense", q, limit=k + 1, tier_filter="content")),
     }
 
     mode_results: dict[str, dict] = {}
@@ -840,7 +857,7 @@ def benchmark_dual_space(
 
         # Get the correct vector for each space
         vectors = qpt.get("vectors", {})
-        cosine_vec = vectors.get("cosine", qpt["vector"])
+        cosine_vec = vectors.get("dense", vectors.get("cosine", qpt["vector"]))
         poincare_vec = vectors.get("poincare", qpt["vector"])
 
         # Fetch results from both spaces using correct vectors
@@ -850,7 +867,7 @@ def benchmark_dual_space(
             continue
 
         try:
-            cos_unified = _search_named(client, unified_collection, "cosine", cosine_vec, limit=over_fetch, tier_filter="content")
+            cos_unified = _search_named(client, unified_collection, "dense", cosine_vec, limit=over_fetch, tier_filter="content")
         except Exception:
             cos_unified = []
 
@@ -1046,6 +1063,816 @@ def print_comparison_table(
 
 
 # ---------------------------------------------------------------------------
+# BenchmarkRunner — unified engine with 8 suites
+# ---------------------------------------------------------------------------
+
+
+class BenchmarkRunner:
+    """Unified benchmark engine with 8 suites.
+
+    Suites:
+      1. gromov_delta          — 4-point hyperbolicity measure
+      2. hierarchy_separation  — Busemann depth per tier + Einstein midpoints
+      3. drill_down            — vertical traversal recall (chatbot pattern)
+      4. lateral               — horizontal same-tier search (chatbot pattern)
+      5. cross_branch          — structural similarity across domains (chatbot)
+      6. depth_band            — Busemann depth-filtered search precision
+      7. unified_vs_separate   — compare unified and per-tier collections
+      8. latency               — throughput and p50/p95/p99
+    """
+
+    def __init__(self, client: QdrantClient, qdrant_url: str, dataset: str, curvature: float = 5.0):
+        self.client = client
+        self.qdrant_url = qdrant_url
+        self.dataset = dataset
+        self.curvature = curvature
+        self.results: dict = {}
+
+        # Core collection names
+        self.unified_collection = f"{dataset}_unified"
+        self.cosine_collection = f"{dataset}_cosine"
+
+        # Lazy-loaded point caches
+        self._points_poincare: list[dict] | None = None
+        self._points_cosine: list[dict] | None = None
+
+    # ------------------------------------------------------------------
+    # Point caching
+    # ------------------------------------------------------------------
+
+    def _load_unified_points(self, vector_name: str = "poincare") -> list[dict]:
+        """Load and cache points from the unified collection."""
+        if self._points_poincare is None:
+            print(f"  Loading points from {self.unified_collection} (vector={vector_name})...")
+            try:
+                self._points_poincare = scroll_all(self.client, self.unified_collection, vector_name=vector_name)
+                print(f"  Loaded {len(self._points_poincare)} points")
+            except Exception as e:
+                print(f"  WARNING: Could not load {self.unified_collection}: {e}")
+                self._points_poincare = []
+        return self._points_poincare
+
+    def _load_cosine_points(self) -> list[dict]:
+        """Load and cache points from the cosine baseline collection."""
+        if self._points_cosine is None:
+            print(f"  Loading points from {self.cosine_collection}...")
+            try:
+                self._points_cosine = scroll_all(self.client, self.cosine_collection)
+                print(f"  Loaded {len(self._points_cosine)} points")
+            except Exception as e:
+                print(f"  WARNING: Could not load {self.cosine_collection}: {e}")
+                self._points_cosine = []
+        return self._points_cosine
+
+    def _get_points_by_tier(self, points: list[dict], tier: str) -> list[dict]:
+        """Filter points by tier (handles both unified and legacy tier names)."""
+        return [p for p in points if p["tier"] == tier]
+
+    # ------------------------------------------------------------------
+    # run_all
+    # ------------------------------------------------------------------
+
+    def run_all(self) -> dict:
+        """Run all 8 benchmark suites in order."""
+        print(f"\n{'='*60}")
+        print(f"Benchmarking dataset: {self.dataset}")
+        print(f"Curvature: {self.curvature}")
+        print(f"{'='*60}")
+
+        self.suite_gromov_delta()
+        self.suite_hierarchy_separation()
+        self.suite_drill_down()
+        self.suite_lateral()
+        self.suite_cross_branch()
+        self.suite_depth_band()
+        self.suite_unified_vs_separate()
+        self.suite_latency()
+
+        return self.results
+
+    # ------------------------------------------------------------------
+    # Suite 1: Gromov Delta
+    # ------------------------------------------------------------------
+
+    def suite_gromov_delta(self) -> dict:
+        """Compute Gromov delta-hyperbolicity of the poincare vectors."""
+        print(f"\n--- Suite 1: Gromov Delta ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["gromov_delta"] = result
+                return result
+
+            # Extract poincare vectors
+            vectors = []
+            for pt in points:
+                vec = pt.get("vectors", {}).get("poincare", pt["vector"])
+                vectors.append(np.array(vec, dtype=np.float32))
+
+            if len(vectors) < 4:
+                result = {"error": "need at least 4 vectors"}
+                self.results["gromov_delta"] = result
+                return result
+
+            vectors_array = np.array(vectors)
+            num_samples = min(2000, len(vectors) * (len(vectors) - 1))
+            delta, recommendation = gromov_delta(vectors_array, num_samples=num_samples)
+
+            result = {
+                "delta": float(delta),
+                "recommendation": recommendation,
+                "num_vectors": len(vectors),
+                "num_samples": num_samples,
+            }
+            self.results["gromov_delta"] = result
+
+            print(f"  delta = {delta:.4f}")
+            print(f"  recommendation = {recommendation}")
+            print(f"  num_vectors = {len(vectors)}")
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["gromov_delta"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["gromov_delta"]
+
+    # ------------------------------------------------------------------
+    # Suite 2: Hierarchy Separation
+    # ------------------------------------------------------------------
+
+    def suite_hierarchy_separation(self) -> dict:
+        """Compute Busemann depth per tier, separation metrics, and Einstein midpoint quality."""
+        print(f"\n--- Suite 2: Hierarchy Separation ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["hierarchy_separation"] = result
+                return result
+
+            # Reuse the existing benchmark function
+            sep_res = benchmark_hierarchy_separation(points, curvature=self.curvature)
+
+            # Add Einstein midpoint quality comparison
+            tier_map = {"narrative": "root", "story": "mid", "content": "leaf"}
+            tier_vectors: dict[str, list[np.ndarray]] = {"root": [], "mid": [], "leaf": []}
+            for pt in points:
+                tier = tier_map.get(pt["tier"], pt["tier"])
+                if tier in tier_vectors:
+                    vec = pt.get("vectors", {}).get("poincare", pt["vector"])
+                    tier_vectors[tier].append(np.array(vec, dtype=np.float32))
+
+            # Compute Einstein midpoints for each tier
+            midpoints = {}
+            for tier, vecs in tier_vectors.items():
+                if len(vecs) >= 2:
+                    try:
+                        mp = einstein_midpoint(vecs, c=self.curvature)
+                        midpoints[tier] = mp
+                    except Exception:
+                        pass
+
+            # Compute pairwise midpoint distances if we have all three
+            if len(midpoints) >= 2:
+                midpoint_distances = {}
+                tier_names = list(midpoints.keys())
+                for i, t1 in enumerate(tier_names):
+                    for t2 in tier_names[i + 1:]:
+                        dist = float(np.linalg.norm(midpoints[t1] - midpoints[t2]))
+                        midpoint_distances[f"{t1}_vs_{t2}"] = dist
+                sep_res["einstein_midpoint_distances"] = midpoint_distances
+
+                # Midpoint norms (distance from origin = depth proxy)
+                midpoint_norms = {}
+                for tier, mp in midpoints.items():
+                    midpoint_norms[tier] = float(np.linalg.norm(mp))
+                sep_res["einstein_midpoint_norms"] = midpoint_norms
+
+            self.results["hierarchy_separation"] = sep_res
+
+            # Print summary
+            sep_ratio = sep_res.get("separation_ratio")
+            cross_sep = sep_res.get("cross_tier_separation")
+            band_ovlp = sep_res.get("band_overlap")
+            tier_acc = sep_res.get("tier_classification_accuracy")
+            print(f"  sep_ratio = {sep_ratio:.4f}" if sep_ratio else "  sep_ratio = N/A")
+            print(f"  cross_tier_sep = {cross_sep:.4f}" if cross_sep else "  cross_tier_sep = N/A")
+            print(f"  band_overlap = {band_ovlp:.4f}" if band_ovlp is not None else "  band_overlap = N/A")
+            print(f"  tier_accuracy = {tier_acc:.4f}" if tier_acc else "  tier_accuracy = N/A")
+            if "einstein_midpoint_distances" in sep_res:
+                for pair, dist in sep_res["einstein_midpoint_distances"].items():
+                    print(f"  einstein_midpoint_{pair} = {dist:.4f}")
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["hierarchy_separation"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["hierarchy_separation"]
+
+    # ------------------------------------------------------------------
+    # Suite 3: Drill-Down Queries
+    # ------------------------------------------------------------------
+
+    def suite_drill_down(self) -> dict:
+        """Evaluate vertical traversal: narrative -> stories -> content."""
+        print(f"\n--- Suite 3: Drill-Down Queries ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["drill_down"] = result
+                return result
+
+            # Select narrative-tier points
+            narrative_points = [p for p in points if p["tier"] == "narrative"]
+            if not narrative_points:
+                result = {"error": "no narrative-tier points found"}
+                self.results["drill_down"] = result
+                print(f"  {result['error']}")
+                return result
+
+            sample = narrative_points[:100]
+            print(f"  Testing {len(sample)} narrative points...")
+
+            # Build child_ids lookup from payload
+            id_to_pt = {p["id"]: p for p in points}
+
+            methods = ["poincare", "dense"]
+            method_results: dict[str, dict] = {}
+
+            for method in methods:
+                hop1_recalls = []
+                precisions = []
+                latencies = []
+                errors = 0
+
+                for pt in sample:
+                    result = drill_down_query(
+                        self.client, self.unified_collection,
+                        start_point_id=pt["id"], using=method, limit=10, ef=128,
+                    )
+
+                    if "error" in result:
+                        errors += 1
+                        continue
+
+                    latencies.append(result["total_latency_ms"])
+
+                    # Measure hop1 recall: what fraction of results are actual children?
+                    # We check by looking at parent_ids of returned points
+                    hop1_results = result.get("hop1_results", [])
+                    if hop1_results:
+                        # Count results whose parent_ids match our start point
+                        point_id_str = pt.get("point_id", str(pt["id"]))
+                        true_children = 0
+                        for r in hop1_results:
+                            r_payload = r.payload if hasattr(r, "payload") and r.payload else {}
+                            r_parent_ids = r_payload.get("parent_ids", [])
+                            if point_id_str in r_parent_ids:
+                                true_children += 1
+                        hop1_recalls.append(true_children / len(hop1_results))
+
+                        # Precision: fraction sharing domain with query
+                        same_domain = 0
+                        for r in hop1_results:
+                            r_payload = r.payload if hasattr(r, "payload") and r.payload else {}
+                            if r_payload.get("domain") == pt.get("domain"):
+                                same_domain += 1
+                        precisions.append(same_domain / len(hop1_results))
+
+                def _safe_mean(lst):
+                    return float(np.mean(lst)) if lst else None
+
+                method_results[method] = {
+                    "num_queries": len(sample) - errors,
+                    "errors": errors,
+                    "hop1_recall": _safe_mean(hop1_recalls),
+                    "precision": _safe_mean(precisions),
+                    "avg_latency_ms": _safe_mean(latencies),
+                    "p95_latency_ms": float(np.percentile(latencies, 95)) if latencies else None,
+                }
+
+                print(f"  {method}: hop1_recall={_safe_mean(hop1_recalls):.4f}" if hop1_recalls else f"  {method}: hop1_recall=N/A", end="")
+                print(f", precision={_safe_mean(precisions):.4f}" if precisions else ", precision=N/A", end="")
+                print(f", avg_latency={_safe_mean(latencies):.1f}ms" if latencies else ", avg_latency=N/A")
+
+            self.results["drill_down"] = method_results
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["drill_down"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["drill_down"]
+
+    # ------------------------------------------------------------------
+    # Suite 4: Lateral Exploration
+    # ------------------------------------------------------------------
+
+    def suite_lateral(self) -> dict:
+        """Evaluate horizontal search within the same tier."""
+        print(f"\n--- Suite 4: Lateral Exploration ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["lateral"] = result
+                return result
+
+            # Sample random points
+            sample_size = min(200, len(points))
+            sample = random.sample(points, sample_size)
+            print(f"  Testing {sample_size} random points...")
+
+            id_to_pt = {p["id"]: p for p in points}
+            methods = ["dense", "poincare"]
+            method_results: dict[str, dict] = {}
+
+            for method in methods:
+                area_recalls = []
+                domain_recalls = []
+                diversities = []
+                latencies = []
+                errors = 0
+
+                for pt in sample:
+                    result = lateral_query(
+                        self.client, self.unified_collection,
+                        query_point_id=pt["id"], using=method, limit=10, ef=128,
+                    )
+
+                    if "error" in result:
+                        errors += 1
+                        continue
+
+                    latencies.append(result["latency_ms"])
+                    results_list = result.get("results", [])
+
+                    if not results_list:
+                        continue
+
+                    # Measure area recall: same area as query
+                    same_area = 0
+                    same_domain = 0
+                    unique_areas = set()
+
+                    for r in results_list:
+                        r_payload = r.payload if hasattr(r, "payload") and r.payload else {}
+                        r_pt = {"area": r_payload.get("area"), "domain": r_payload.get("domain"),
+                                "all_paths": r_payload.get("all_paths", []),
+                                "hierarchy_path": r_payload.get("hierarchy_path", "")}
+
+                        if _paths_match_area(pt, r_pt):
+                            same_area += 1
+                        if _paths_match_domain(pt, r_pt):
+                            same_domain += 1
+
+                        area_val = r_payload.get("area")
+                        if area_val is not None:
+                            unique_areas.add(area_val)
+
+                    n = len(results_list)
+                    area_recalls.append(same_area / n)
+                    domain_recalls.append(same_domain / n)
+                    diversities.append(len(unique_areas))
+
+                def _safe_mean(lst):
+                    return float(np.mean(lst)) if lst else None
+
+                method_results[method] = {
+                    "num_queries": len(sample) - errors,
+                    "errors": errors,
+                    "area_recall": _safe_mean(area_recalls),
+                    "domain_recall": _safe_mean(domain_recalls),
+                    "avg_diversity": _safe_mean(diversities),
+                    "avg_latency_ms": _safe_mean(latencies),
+                }
+
+                print(f"  {method}: area_recall={_safe_mean(area_recalls):.4f}" if area_recalls else f"  {method}: area_recall=N/A", end="")
+                print(f", domain_recall={_safe_mean(domain_recalls):.4f}" if domain_recalls else ", domain_recall=N/A", end="")
+                print(f", diversity={_safe_mean(diversities):.1f}" if diversities else ", diversity=N/A")
+
+            self.results["lateral"] = method_results
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["lateral"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["lateral"]
+
+    # ------------------------------------------------------------------
+    # Suite 5: Cross-Branch Discovery
+    # ------------------------------------------------------------------
+
+    def suite_cross_branch(self) -> dict:
+        """Evaluate structural similarity search across domains."""
+        print(f"\n--- Suite 5: Cross-Branch Discovery ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["cross_branch"] = result
+                return result
+
+            # Select narrative points
+            narrative_points = [p for p in points if p["tier"] == "narrative"]
+            if not narrative_points:
+                result = {"error": "no narrative-tier points found"}
+                self.results["cross_branch"] = result
+                print(f"  {result['error']}")
+                return result
+
+            sample = narrative_points[:50]
+            print(f"  Testing {len(sample)} narrative points...")
+
+            methods = ["poincare", "dense"]
+            method_results: dict[str, dict] = {}
+
+            for method in methods:
+                unique_domains_counts = []
+                depth_similarities = []
+                latencies = []
+                errors = 0
+
+                for pt in sample:
+                    result = cross_branch_query(
+                        self.client, self.unified_collection,
+                        narrative_point_id=pt["id"], using=method, limit=10, ef=128,
+                    )
+
+                    if "error" in result:
+                        errors += 1
+                        continue
+
+                    latencies.append(result["latency_ms"])
+                    results_list = result.get("results", [])
+
+                    if not results_list:
+                        continue
+
+                    # Count unique domains in results
+                    domains = set()
+                    depths = []
+                    for r in results_list:
+                        r_payload = r.payload if hasattr(r, "payload") and r.payload else {}
+                        domain = r_payload.get("domain")
+                        if domain is not None:
+                            domains.add(domain)
+                        bd = r_payload.get("busemann_depth")
+                        if bd is not None:
+                            depths.append(bd)
+
+                    unique_domains_counts.append(len(domains))
+
+                    # Structural depth similarity: how close are result depths to query depth?
+                    query_depth = pt.get("busemann_depth")
+                    if query_depth is not None and depths:
+                        depth_diffs = [abs(d - query_depth) for d in depths]
+                        depth_similarities.append(float(np.mean(depth_diffs)))
+
+                def _safe_mean(lst):
+                    return float(np.mean(lst)) if lst else None
+
+                method_results[method] = {
+                    "num_queries": len(sample) - errors,
+                    "errors": errors,
+                    "avg_unique_domains": _safe_mean(unique_domains_counts),
+                    "avg_depth_similarity": _safe_mean(depth_similarities),
+                    "avg_latency_ms": _safe_mean(latencies),
+                }
+
+                print(f"  {method}: unique_domains={_safe_mean(unique_domains_counts):.1f}" if unique_domains_counts else f"  {method}: unique_domains=N/A", end="")
+                print(f", depth_sim={_safe_mean(depth_similarities):.4f}" if depth_similarities else ", depth_sim=N/A")
+
+            self.results["cross_branch"] = method_results
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["cross_branch"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["cross_branch"]
+
+    # ------------------------------------------------------------------
+    # Suite 6: Depth-Band Filtering
+    # ------------------------------------------------------------------
+
+    def suite_depth_band(self) -> dict:
+        """Evaluate Busemann depth-band filtered search precision."""
+        print(f"\n--- Suite 6: Depth-Band Filtering ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["depth_band"] = result
+                return result
+
+            # Compute depth stats from hierarchy separation or from points
+            tier_map = {"narrative": "root", "story": "mid", "content": "leaf"}
+            tier_depths: dict[str, list[float]] = {"root": [], "mid": [], "leaf": []}
+            for pt in points:
+                bd = pt.get("busemann_depth")
+                if bd is not None:
+                    tier = tier_map.get(pt["tier"], pt["tier"])
+                    if tier in tier_depths:
+                        tier_depths[tier].append(bd)
+
+            # Define depth bands from tier statistics
+            bands: list[dict] = []
+            for tier in ("root", "mid", "leaf"):
+                ds = tier_depths[tier]
+                if ds:
+                    mean_d = float(np.mean(ds))
+                    std_d = float(np.std(ds))
+                    bands.append({
+                        "name": tier,
+                        "depth_min": mean_d - 2 * std_d,
+                        "depth_max": mean_d + 2 * std_d,
+                        "expected_tier": tier,
+                    })
+
+            if not bands:
+                # Fallback: use default bands if no busemann_depth in payload
+                bands = [
+                    {"name": "shallow", "depth_min": -2.0, "depth_max": 0.0, "expected_tier": "root"},
+                    {"name": "middle", "depth_min": 0.0, "depth_max": 1.0, "expected_tier": "mid"},
+                    {"name": "deep", "depth_min": 1.0, "depth_max": 3.0, "expected_tier": "leaf"},
+                ]
+
+            print(f"  Defined {len(bands)} depth bands")
+
+            # Sample query vectors from content tier
+            content_points = [p for p in points if p["tier"] in ("leaf", "content")]
+            if not content_points:
+                content_points = points
+            query_sample = random.sample(content_points, min(100, len(content_points)))
+
+            band_results: dict[str, dict] = {}
+            for band in bands:
+                precisions = []
+                counts = []
+                latencies = []
+
+                for qpt in query_sample:
+                    query_vec = qpt.get("vectors", {}).get("poincare", qpt["vector"])
+                    if hasattr(query_vec, "tolist"):
+                        query_vec_list = query_vec.tolist()
+                    else:
+                        query_vec_list = list(query_vec)
+
+                    result = depth_band_query(
+                        self.client, self.unified_collection,
+                        query_vector=query_vec_list,
+                        depth_min=band["depth_min"],
+                        depth_max=band["depth_max"],
+                        using="poincare", limit=10, ef=128,
+                    )
+
+                    if "error" in result:
+                        continue
+
+                    latencies.append(result["latency_ms"])
+                    results_list = result.get("results", [])
+                    counts.append(len(results_list))
+
+                    if results_list:
+                        # Precision: fraction of results actually in the depth band
+                        in_band = 0
+                        for r in results_list:
+                            r_payload = r.payload if hasattr(r, "payload") and r.payload else {}
+                            bd = r_payload.get("busemann_depth")
+                            if bd is not None and band["depth_min"] <= bd <= band["depth_max"]:
+                                in_band += 1
+                        precisions.append(in_band / len(results_list))
+
+                def _safe_mean(lst):
+                    return float(np.mean(lst)) if lst else None
+
+                band_results[band["name"]] = {
+                    "depth_min": band["depth_min"],
+                    "depth_max": band["depth_max"],
+                    "precision": _safe_mean(precisions),
+                    "avg_result_count": _safe_mean(counts),
+                    "avg_latency_ms": _safe_mean(latencies),
+                    "num_queries": len(precisions),
+                }
+
+                print(f"  band={band['name']}: precision={_safe_mean(precisions):.4f}" if precisions else f"  band={band['name']}: precision=N/A", end="")
+                print(f", avg_count={_safe_mean(counts):.1f}" if counts else ", avg_count=N/A")
+
+            self.results["depth_band"] = band_results
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["depth_band"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["depth_band"]
+
+    # ------------------------------------------------------------------
+    # Suite 7: Unified vs Separate
+    # ------------------------------------------------------------------
+
+    def suite_unified_vs_separate(self) -> dict:
+        """Compare unified collection vs separate per-tier collections."""
+        print(f"\n--- Suite 7: Unified vs Separate ---")
+        try:
+            # Check which separate collections exist
+            separate_collections = {
+                "narratives": f"{self.dataset}_narratives",
+                "stories": f"{self.dataset}_stories",
+                "content": f"{self.dataset}_content",
+            }
+
+            existing_separate: dict[str, str] = {}
+            try:
+                all_collections = {c.name for c in self.client.get_collections().collections}
+            except Exception:
+                all_collections = set()
+
+            for tier_name, col_name in separate_collections.items():
+                if col_name in all_collections:
+                    existing_separate[tier_name] = col_name
+
+            if not existing_separate:
+                result = {"note": "no separate tier collections found, skipping comparison"}
+                self.results["unified_vs_separate"] = result
+                print(f"  No separate collections found ({list(separate_collections.values())})")
+                print("  Skipping comparison")
+                return result
+
+            print(f"  Found separate collections: {list(existing_separate.values())}")
+
+            # Load unified points
+            points_unified = self._load_unified_points()
+            if not points_unified:
+                result = {"error": "no unified points loaded"}
+                self.results["unified_vs_separate"] = result
+                return result
+
+            unified_id_to_pt = {p["id"]: p for p in points_unified}
+
+            comparison = {}
+
+            # Run drill-down on unified
+            narrative_points = [p for p in points_unified if p["tier"] == "narrative"]
+            drill_sample = narrative_points[:50]
+
+            if drill_sample:
+                # Unified drill-down
+                unified_latencies = []
+                unified_recalls = []
+                for pt in drill_sample:
+                    res = drill_down_query(
+                        self.client, self.unified_collection,
+                        start_point_id=pt["id"], using="poincare", limit=10, ef=128,
+                    )
+                    if "error" not in res:
+                        unified_latencies.append(res["total_latency_ms"])
+                        hop1 = res.get("hop1_results", [])
+                        if hop1:
+                            point_id_str = str(pt["id"])
+                            children = sum(
+                                1 for r in hop1
+                                if point_id_str in (r.payload or {}).get("parent_ids", [])
+                                or pt["id"] in (r.payload or {}).get("parent_ids", [])
+                            )
+                            unified_recalls.append(children / len(hop1))
+
+                def _safe_mean(lst):
+                    return float(np.mean(lst)) if lst else None
+
+                comparison["unified_drill_down"] = {
+                    "avg_latency_ms": _safe_mean(unified_latencies),
+                    "hop1_recall": _safe_mean(unified_recalls),
+                    "num_queries": len(drill_sample),
+                }
+
+            # Lateral on unified
+            lateral_sample = random.sample(points_unified, min(100, len(points_unified)))
+            unified_lat_latencies = []
+            unified_lat_area_recalls = []
+            for pt in lateral_sample:
+                res = lateral_query(
+                    self.client, self.unified_collection,
+                    query_point_id=pt["id"], using="dense", limit=10, ef=128,
+                )
+                if "error" not in res:
+                    unified_lat_latencies.append(res["latency_ms"])
+                    results_list = res.get("results", [])
+                    if results_list:
+                        same_area = sum(
+                            1 for r in results_list
+                            if _paths_match_area(
+                                pt,
+                                {"area": (r.payload or {}).get("area"),
+                                 "domain": (r.payload or {}).get("domain"),
+                                 "all_paths": (r.payload or {}).get("all_paths", []),
+                                 "hierarchy_path": (r.payload or {}).get("hierarchy_path", "")},
+                            )
+                        )
+                        unified_lat_area_recalls.append(same_area / len(results_list))
+
+            comparison["unified_lateral"] = {
+                "avg_latency_ms": _safe_mean(unified_lat_latencies),
+                "area_recall": _safe_mean(unified_lat_area_recalls),
+                "num_queries": len(lateral_sample),
+            }
+
+            # Try separate collections for comparison
+            for tier_name, col_name in existing_separate.items():
+                try:
+                    sep_points = scroll_all(self.client, col_name)
+                    if not sep_points:
+                        continue
+                    sep_sample = random.sample(sep_points, min(50, len(sep_points)))
+
+                    sep_latencies = []
+                    sep_area_recalls = []
+                    sep_id_to_pt = {p["id"]: p for p in sep_points}
+
+                    for qpt in sep_sample:
+                        try:
+                            results = _search(self.client, col_name, qpt["vector"], limit=11)
+                            neighbors = [r for r in results if r.id != qpt["id"]][:10]
+                            if not neighbors:
+                                continue
+                            same_area = sum(
+                                1 for nb in neighbors
+                                if nb.id in sep_id_to_pt
+                                and _paths_match_area(qpt, sep_id_to_pt[nb.id])
+                            )
+                            sep_area_recalls.append(same_area / len(neighbors))
+                        except Exception:
+                            continue
+
+                    comparison[f"separate_{tier_name}"] = {
+                        "collection": col_name,
+                        "num_points": len(sep_points),
+                        "area_recall": _safe_mean(sep_area_recalls),
+                        "num_queries": len(sep_area_recalls),
+                    }
+                    print(f"  {col_name}: area_recall={_safe_mean(sep_area_recalls):.4f}" if sep_area_recalls else f"  {col_name}: area_recall=N/A")
+                except Exception as e:
+                    comparison[f"separate_{tier_name}"] = {"error": str(e)}
+
+            # Print unified summary
+            ud = comparison.get("unified_drill_down", {})
+            ul = comparison.get("unified_lateral", {})
+            print(f"  unified drill_down: recall={ud.get('hop1_recall', 'N/A')}, latency={ud.get('avg_latency_ms', 'N/A')}")
+            print(f"  unified lateral: area_recall={ul.get('area_recall', 'N/A')}, latency={ul.get('avg_latency_ms', 'N/A')}")
+
+            self.results["unified_vs_separate"] = comparison
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["unified_vs_separate"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["unified_vs_separate"]
+
+    # ------------------------------------------------------------------
+    # Suite 8: Latency
+    # ------------------------------------------------------------------
+
+    def suite_latency(self) -> dict:
+        """Measure throughput and latency at multiple ef values."""
+        print(f"\n--- Suite 8: Latency ---")
+        try:
+            points = self._load_unified_points()
+            if not points:
+                result = {"error": "no points loaded"}
+                self.results["latency"] = result
+                return result
+
+            lat_res = benchmark_latency(
+                self.client, self.unified_collection, points,
+                num_queries=1000, vector_name="poincare",
+            )
+            self.results["latency"] = lat_res
+
+            for ef in EF_VALUES:
+                ef_data = lat_res.get(f"ef_{ef}", {})
+                qps = ef_data.get("qps")
+                p50 = ef_data.get("p50_ms")
+                p95 = ef_data.get("p95_ms")
+                p99 = ef_data.get("p99_ms")
+                if qps and p95:
+                    print(f"  ef={ef}: qps={qps:.1f}, p50={p50:.1f}ms, p95={p95:.1f}ms, p99={p99:.1f}ms")
+
+        except Exception as e:
+            result = {"error": str(e)}
+            self.results["latency"] = result
+            print(f"  ERROR: {e}")
+
+        return self.results["latency"]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1060,189 +1887,54 @@ def main() -> None:
         help="Qdrant gRPC/HTTP URL (default: http://localhost:6334)",
     )
     parser.add_argument(
-        "--suite",
-        default="all",
-        choices=["all", "hierarchy", "retrieval", "cross-tier", "dual-space", "latency"],
-        help="Which benchmark suite to run (default: all)",
+        "--dataset",
+        default="bgc",
+        choices=["bgc", "hwv", "wos", "eurlex"],
+        help="Which dataset to benchmark (default: bgc)",
+    )
+    parser.add_argument(
+        "--suites",
+        nargs="*",
+        default=None,
+        help="Run specific suites (default: all). "
+             "Options: gromov_delta, hierarchy_separation, drill_down, lateral, "
+             "cross_branch, depth_band, unified_vs_separate, latency",
+    )
+    parser.add_argument(
+        "--curvature",
+        type=float,
+        default=5.0,
+        help="Poincare ball curvature (default: 5.0)",
     )
     args = parser.parse_args()
 
     random.seed(42)
     np.random.seed(42)
 
-    client = QdrantClient(url=args.qdrant_url)
+    client = QdrantClient(url=args.qdrant_url, timeout=60)
 
-    collection_configs = discover_collections(client, args.qdrant_url)
-    if not collection_configs:
-        print("No wos_* collections found. Run embed.py first.")
-        return
+    runner = BenchmarkRunner(client, args.qdrant_url, args.dataset, curvature=args.curvature)
 
-    print(f"Discovered collections: {[c['name'] for c in collection_configs]}")
-
-    all_results: dict = {}
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    output_path = results_dir / f"benchmark_{timestamp}.json"
-
-    # Find unified + cosine collection pairs grouped by prefix (wos, bgc, scihtc)
-    # Each prefix can have at most one unified and one cosine collection
-    dataset_pairs: list[tuple[str, str]] = []  # (unified_name, cosine_name)
-    prefix_unified: dict[str, str] = {}
-    prefix_cosine: dict[str, str] = {}
-    for c in collection_configs:
-        # Extract prefix from name (e.g., "wos" from "wos_unified")
-        name = c["name"]
-        for pfx in ["wos", "bgc", "scihtc", "eurlex"]:
-            if name.startswith(pfx + "_"):
-                if c.get("strategy") == "unified" and "_c" not in name.replace(pfx + "_unified", ""):
-                    prefix_unified[pfx] = name
-                if c.get("strategy") is None and name == pfx + "_cosine":
-                    prefix_cosine[pfx] = name
-                break
-
-    for pfx in sorted(set(prefix_unified) & set(prefix_cosine)):
-        dataset_pairs.append((prefix_unified[pfx], prefix_cosine[pfx]))
-
-    # --- Standard per-collection benchmarks ---
-    for col_cfg in collection_configs:
-        collection = col_cfg["name"]
-        curvature = col_cfg["curvature"]
-        strategy = col_cfg.get("strategy") or "cosine"
-
-        print(f"\n{'='*60}")
-        print(f"Collection: {collection}  (strategy={strategy}, curvature={curvature})")
-        print(f"{'='*60}")
-
-        vector_name = "poincare" if strategy == "unified" else None
-        print("  Loading points...")
-        points = scroll_all(client, collection, vector_name=vector_name)
-        print(f"  Loaded {len(points)} points")
-
-        col_results: dict = {}
-
-        # --- Benchmark 1: Hierarchy Separation ---
-        if args.suite in ("all", "hierarchy"):
-            if col_cfg["is_poincare"] and curvature is not None:
-                print("  [1] Hierarchy Separation...")
-                sep_res = benchmark_hierarchy_separation(points, curvature=curvature)
-                col_results["hierarchy_separation"] = sep_res
-                sep_ratio = sep_res.get("separation_ratio")
-                sep_content = sep_res.get("separation_ratio_content")
-                cross_sep = sep_res.get("cross_tier_separation")
-                band_ovlp = sep_res.get("band_overlap")
-                tier_acc = sep_res.get("tier_classification_accuracy")
-                print(f"      sep_ratio_all={sep_ratio:.4f}" if sep_ratio else "      sep_ratio_all=N/A")
-                print(f"      sep_ratio_content={sep_content:.4f}" if sep_content else "      sep_ratio_content=N/A")
-                print(f"      cross_tier_sep={cross_sep:.4f}" if cross_sep else "      cross_tier_sep=N/A")
-                print(f"      band_overlap={band_ovlp:.4f}" if band_ovlp else "      band_overlap=N/A")
-                print(f"      tier_accuracy={tier_acc:.4f}" if tier_acc else "      tier_accuracy=N/A")
+    if args.suites:
+        for suite_name in args.suites:
+            method = getattr(runner, f"suite_{suite_name}", None)
+            if method:
+                method()
             else:
-                col_results["hierarchy_separation"] = {}
-
-        # --- Benchmark 2: Retrieval Quality ---
-        if args.suite in ("all", "retrieval"):
-            print("  [2] Retrieval Quality (500 queries)...")
-            rq_res = benchmark_retrieval_quality(client, collection, points, k=10, num_queries=500, vector_name=vector_name)
-            col_results["retrieval_quality"] = rq_res
-            ar = rq_res.get("area_recall_at_10")
-            dr = rq_res.get("domain_recall_at_10")
-            hp = rq_res.get("hierarchical_precision")
-            print(f"      area_recall@10={ar:.4f}" if ar else "      area_recall@10=N/A")
-            print(f"      domain_recall@10={dr:.4f}" if dr else "      domain_recall@10=N/A")
-            print(f"      h_precision={hp:.4f}" if hp else "      h_precision=N/A")
-
-        # --- Benchmark 5: Latency ---
-        if args.suite in ("all", "latency"):
-            print("  [5] Latency (1000 queries)...")
-            lat_res = benchmark_latency(client, collection, points, num_queries=1000, vector_name=vector_name)
-            col_results["latency"] = lat_res
-            for ef in EF_VALUES:
-                ef_data = lat_res.get(f"ef_{ef}", {})
-                qps = ef_data.get("qps")
-                p95 = ef_data.get("p95_ms")
-                if qps and p95:
-                    print(f"      ef={ef}: qps={qps:.1f}, p95={p95:.1f}ms")
-
-        all_results[collection] = col_results
-
-    # --- Unified-specific benchmarks (per dataset pair) ---
-    for unified_name, cosine_name in dataset_pairs:
-        print(f"\n  === Dataset pair: unified={unified_name}, cosine={cosine_name} ===")
-
-        # --- Benchmark 3: Cross-Tier Retrieval ---
-        if args.suite in ("all", "cross-tier"):
-            print(f"\n{'='*60}")
-            print(f"Cross-Tier Retrieval ({unified_name}, poincare)")
-            print(f"{'='*60}")
-            points_unified = scroll_all(client, unified_name, vector_name="poincare")
-            ct_res = benchmark_cross_tier(client, unified_name, points_unified, k=5)
-            all_results.setdefault(unified_name, {})["cross_tier"] = ct_res
-            print(f"  parent_story_recall:     {ct_res.get('parent_story_recall')}")
-            print(f"  parent_narrative_recall:  {ct_res.get('parent_narrative_recall')}")
-            print(f"  child_story_recall:       {ct_res.get('child_story_recall')}")
-
-        # --- Benchmark 2b: Multi-Mode Retrieval ---
-        if args.suite in ("all", "retrieval"):
-            print(f"\n{'='*60}")
-            print(f"Multi-Mode Retrieval Quality ({unified_name})")
-            print(f"{'='*60}")
-            points_unified_poincare = scroll_all(client, unified_name, vector_name="poincare")
-            mr_res = benchmark_retrieval_modes(client, unified_name, points_unified_poincare, k=10, num_queries=500)
-            all_results.setdefault(unified_name, {})["retrieval_modes"] = mr_res
-
-            print(f"\n  {'Mode':<24} {'AreaRec@10':>12} {'DomRec@10':>12} {'H-Prec':>8}")
-            print(f"  {'-'*56}")
-            for mode in ("unfiltered", "tier_filtered", "depth_range", "cosine_tier_filtered"):
-                m = mr_res.get(mode, {})
-                ar = m.get("area_recall_at_10")
-                dr = m.get("domain_recall_at_10")
-                hp = m.get("hierarchical_precision")
-                ar_s = f"{ar:.4f}" if ar is not None else "N/A"
-                dr_s = f"{dr:.4f}" if dr is not None else "N/A"
-                hp_s = f"{hp:.3f}" if hp is not None else "N/A"
-                print(f"  {mode:<24} {ar_s:>12} {dr_s:>12} {hp_s:>8}")
-            band = mr_res.get("depth_range_band", {})
-            print(f"  depth_range band: [{band.get('lo', '?'):.3f}, {band.get('hi', '?'):.3f}]")
-
-        # --- Benchmark 4: Fusion Strategy Comparison ---
-        if args.suite in ("all", "dual-space"):
-            print(f"\n{'='*60}")
-            print("Fusion Strategy Comparison")
-            print(f"{'='*60}")
-            points_unified_cosine = scroll_all(client, unified_name, vector_name="cosine")
-            points_cosine_baseline = scroll_all(client, cosine_name)
-            ds_res = benchmark_dual_space(
-                client, unified_name, cosine_name,
-                points_unified_cosine, points_cosine_baseline,
-                k=10, num_queries=500,
-            )
-            all_results.setdefault(unified_name, {})["dual_space"] = ds_res
-
-            # Sort strategies by area_recall descending
-            strat_scores = []
-            for key, val in ds_res.items():
-                if isinstance(val, dict) and "area_recall_at_10" in val:
-                    strat_scores.append((key, val))
-            strat_scores.sort(key=lambda x: -(x[1].get("area_recall_at_10") or 0))
-
-            print(f"\n  {'Strategy':<24} {'AreaRec@10':>12} {'DomRec@10':>12}")
-            print(f"  {'-'*48}")
-            for key, val in strat_scores:
-                ar = val.get("area_recall_at_10")
-                dr = val.get("domain_recall_at_10")
-                ar_s = f"{ar:.4f}" if ar is not None else "N/A"
-                dr_s = f"{dr:.4f}" if dr is not None else "N/A"
-                marker = " <-- best" if strat_scores[0][0] == key else ""
-                print(f"  {key:<24} {ar_s:>12} {dr_s:>12}{marker}")
-
-    # --- Comparison table ---
-    print_comparison_table(all_results, collection_configs)
+                print(f"Unknown suite: {suite_name}")
+                print("  Available: gromov_delta, hierarchy_separation, drill_down, "
+                      "lateral, cross_branch, depth_band, unified_vs_separate, latency")
+    else:
+        runner.run_all()
 
     # Save results
-    with open(output_path, "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
-    print(f"\nResults saved to {output_path}")
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = results_dir / f"benchmark_{args.dataset}_{timestamp}.json"
+    with open(output, "w") as f:
+        json.dump(runner.results, f, indent=2, default=str)
+    print(f"\nResults saved to {output}")
 
 
 if __name__ == "__main__":

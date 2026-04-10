@@ -353,6 +353,30 @@ impl Distance {
         }
     }
 
+    /// Like [`preprocess_vector`], but accepts an explicit curvature value for Poincaré distance.
+    /// For all other distance functions the curvature parameter is ignored and the standard
+    /// preprocessing is applied.  Only compiled when the `hyperbolic` feature is enabled because
+    /// it is only meaningful for the `Poincare` variant.
+    #[cfg(feature = "hyperbolic")]
+    pub fn preprocess_vector_with_curvature<T: PrimitiveVectorElement>(
+        &self,
+        vector: DenseVector,
+        curvature: f32,
+    ) -> DenseVector
+    where
+        CosineMetric: Metric<T>,
+        EuclidMetric: Metric<T>,
+        DotProductMetric: Metric<T>,
+        ManhattanMetric: Metric<T>,
+    {
+        match self {
+            Distance::Poincare => {
+                crate::spaces::hyperbolic::poincare_math::project_to_ball(vector, curvature)
+            }
+            other => other.preprocess_vector::<T>(vector),
+        }
+    }
+
     pub fn distance_order(&self) -> Order {
         match self {
             Distance::Cosine | Distance::Dot => Order::LargeBetter,

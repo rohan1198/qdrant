@@ -106,6 +106,7 @@ fn test_random_score(
         None,
         deleted_points,
         HardwareCounterCell::new(),
+        None,
     )?;
 
     let points = rng.random_range(1..storage.total_vector_count());

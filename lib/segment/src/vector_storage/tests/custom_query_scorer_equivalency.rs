@@ -183,6 +183,7 @@ fn scoring_equivalency(
             None,
             id_tracker.deleted_point_bitslice(),
             HardwareCounterCell::new(),
+            None,
         )?;
 
         let points = (0..other_storage.total_vector_count() as _).sample(&mut rng, SAMPLE_SIZE);

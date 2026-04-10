@@ -131,6 +131,7 @@ impl VectorIndex for PlainVectorIndex {
             oversampled_top,
             deleted_points,
             query_context.hardware_counter(),
+            None,
         )?;
 
         let deferred_internal_id = query_context.deferred_internal_id();
@@ -159,6 +160,7 @@ impl VectorIndex for PlainVectorIndex {
                 params,
                 top,
                 query_context.hardware_counter(),
+                None,
             )?;
         }
         Ok(search_results)
