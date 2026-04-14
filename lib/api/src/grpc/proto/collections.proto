@@ -35,6 +35,8 @@ message VectorParams {
   optional Datatype datatype = 6;
   // Configuration for multi-vector search
   optional MultiVectorConfig multivector_config = 7;
+  // Poincare ball curvature for hyperbolic distance. Default: 1.0
+  optional float curvature = 8;
 }
 
 message VectorParamsDiff {

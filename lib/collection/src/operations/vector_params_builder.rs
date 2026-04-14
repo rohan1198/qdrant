@@ -20,6 +20,8 @@ impl VectorParamsBuilder {
                 on_disk: None,
                 datatype: None,
                 multivector_config: None,
+                #[cfg(feature = "hyperbolic")]
+                curvature: None,
             },
         }
     }

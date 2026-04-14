@@ -1,11 +1,11 @@
 services:
   qdrant-hyperbolic:
     build:
-      context: ../..
-      dockerfile: dev/testbench/Dockerfile
+      context: .
+      dockerfile: Dockerfile.prebuilt
     ports:
-      - "6334:6333"
-      - "6335:6334"
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
     environment:

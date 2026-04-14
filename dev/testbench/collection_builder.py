@@ -145,6 +145,7 @@ def create_unified_collection(
     dense_dim: int = 1024,
     poincare_dim: int = 128,
     curvature: float = 5.0,
+    tangent_dim: int | None = None,
 ) -> str:
     """Create {dataset}_unified with named vectors: "dense" (Cosine) + "poincare" (Poincare).
 
@@ -173,21 +174,27 @@ def create_unified_collection(
             f"when deleting '{name}': {del_resp.text[:200]}"
         )
 
-    body = {
-        "vectors": {
-            "dense": {
-                "size": dense_dim,
-                "distance": "Cosine",
-                "hnsw_config": {"m": 16, "ef_construct": 200},
-            },
-            "poincare": {
-                "size": poincare_dim,
-                "distance": "Poincare",
-                "hnsw_config": {"m": 16, "ef_construct": 200},
-                "curvature": curvature,
-            },
+    vectors_config: dict = {
+        "dense": {
+            "size": dense_dim,
+            "distance": "Cosine",
+            "hnsw_config": {"m": 16, "ef_construct": 200},
+        },
+        "poincare": {
+            "size": poincare_dim,
+            "distance": "Poincare",
+            "hnsw_config": {"m": 16, "ef_construct": 200},
+            "curvature": curvature,
         },
     }
+
+    if tangent_dim is not None:
+        vectors_config["tangent"] = {
+            "size": tangent_dim,
+            "distance": "Euclid",
+        }
+
+    body = {"vectors": vectors_config}
 
     print(
         f"Creating unified collection '{name}' "
@@ -352,11 +359,16 @@ def populate_collection(
                 dense_vec = dense_vec.tolist()
 
             poincare_vec = pt.get("poincare_vector")
+            tangent_vec = pt.get("tangent_vector")
 
             if poincare_vec is not None:
                 if isinstance(poincare_vec, np.ndarray):
                     poincare_vec = poincare_vec.tolist()
                 vector = {"dense": dense_vec, "poincare": poincare_vec}
+                if tangent_vec is not None:
+                    if isinstance(tangent_vec, np.ndarray):
+                        tangent_vec = tangent_vec.tolist()
+                    vector["tangent"] = tangent_vec
             else:
                 vector = dense_vec
 
@@ -380,6 +392,7 @@ def build_points_from_data(
     poincare_vectors: np.ndarray | None,
     busemann_depths: np.ndarray | None,
     alpha_values: np.ndarray | None,
+    tangent_vectors: np.ndarray | None = None,
     tier_map: dict[int, str] | None = None,
     synthetic_timestamps: list[str] | None = None,
 ) -> list[dict]:
@@ -494,6 +507,8 @@ def build_points_from_data(
         }
         if poincare_vec is not None:
             pt["poincare_vector"] = poincare_vec
+        if tangent_vectors is not None:
+            pt["tangent_vector"] = tangent_vectors[i].tolist()
 
         result.append(pt)
 

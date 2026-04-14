@@ -9,25 +9,21 @@ use super::poincare_math::{stable_acosh, EPS};
 #[target_feature(enable = "avx")]
 #[allow(clippy::missing_safety_doc)]
 unsafe fn hsum256_ps_avx(x: __m256) -> f32 {
-    unsafe {
-        let lr_sum: __m128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
-        let hsum = _mm_hadd_ps(lr_sum, lr_sum);
-        let p1 = _mm_extract_ps(hsum, 0);
-        let p2 = _mm_extract_ps(hsum, 1);
-        f32::from_bits(p1 as u32) + f32::from_bits(p2 as u32)
-    }
+    let lr_sum: __m128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
+    let hsum = _mm_hadd_ps(lr_sum, lr_sum);
+    let p1 = _mm_extract_ps(hsum, 0);
+    let p2 = _mm_extract_ps(hsum, 1);
+    f32::from_bits(p1 as u32) + f32::from_bits(p2 as u32)
 }
 
 /// Four-way horizontal sum of `__m256` accumulators.
 #[target_feature(enable = "avx")]
 #[allow(clippy::missing_safety_doc)]
 unsafe fn four_way_hsum(a: __m256, b: __m256, c: __m256, d: __m256) -> f32 {
-    unsafe {
-        let sum1 = _mm256_add_ps(a, b);
-        let sum2 = _mm256_add_ps(c, d);
-        let total = _mm256_add_ps(sum1, sum2);
-        hsum256_ps_avx(total)
-    }
+    let sum1 = _mm256_add_ps(a, b);
+    let sum2 = _mm256_add_ps(c, d);
+    let total = _mm256_add_ps(sum1, sum2);
+    unsafe { hsum256_ps_avx(total) }
 }
 
 /// AVX2+FMA accelerated Poincare similarity.

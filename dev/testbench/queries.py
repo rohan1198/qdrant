@@ -9,10 +9,13 @@ Five query patterns that mirror real Pythia/Lens chatbot usage:
 5. depth_band   — Busemann depth-filtered search
 """
 import time
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Filter, FieldCondition, MatchValue, Range, SearchParams,
 )
+from hyperbolic_math import alpha_precompute, fused_norms, poincare_distance_with_alpha
+from tangent import tangent_query
 
 
 def drill_down_query(client, collection, start_point_id, using="poincare", limit=10, ef=128):
@@ -516,3 +519,252 @@ def geometric_filtered_query(client, collection, query_vector, filters,
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def alpha_pipeline_query(
+    client,
+    collection,
+    query_poincare,
+    curvature=1.0,
+    prefetch_limit=200,
+    alpha_top=50,
+    final_top=10,
+    using_prefetch="dense",
+    ef=128,
+):
+    """3-stage alpha pipeline: cosine prefetch -> alpha re-rank -> exact Poincare.
+
+    Replaces Klein pipeline. Alpha proxy gives exact ordering (monotonic with
+    Poincare distance), no model conversion needed.
+    """
+    t_start = time.time()
+
+    # Stage 1: Cosine prefetch (server-side)
+    t1 = time.time()
+    prefetch_results = client.query_points(
+        collection_name=collection,
+        query=query_poincare.tolist(),
+        using=using_prefetch,
+        with_payload=True,
+        with_vectors=["poincare"],
+        limit=prefetch_limit,
+        search_params=SearchParams(hnsw_ef=ef),
+    ).points
+    t1_end = time.time()
+
+    if not prefetch_results:
+        return {
+            "results": [], "distances": [],
+            "prefetch_count": 0, "alpha_survivors": 0, "final_count": 0,
+            "stage1_latency_ms": 0, "stage2_latency_ms": 0,
+            "stage3_latency_ms": 0, "total_latency_ms": 0,
+        }
+
+    # Stage 2: Alpha re-rank (client-side, no acosh)
+    t2 = time.time()
+    query_alpha = alpha_precompute(query_poincare, curvature)
+
+    scored = []
+    for pt in prefetch_results:
+        cand_vec = np.array(pt.vector["poincare"])
+        cand_alpha = pt.payload.get("alpha")
+        if cand_alpha is None:
+            cand_alpha = alpha_precompute(cand_vec, curvature)
+        diff = query_poincare - cand_vec
+        diff_sq = float(np.dot(diff, diff))
+        proxy = diff_sq * query_alpha * cand_alpha
+        scored.append((pt, proxy))
+
+    scored.sort(key=lambda x: x[1])
+    survivors = scored[:alpha_top]
+    t2_end = time.time()
+
+    # Stage 3: Exact Poincare (client-side, reuse proxy)
+    t3 = time.time()
+    exact = []
+    for pt, proxy in survivors:
+        sqrt_c = np.sqrt(curvature)
+        arg = 1.0 + 2.0 * curvature * proxy
+        dist = float(np.arccosh(max(arg, 1.0))) / sqrt_c
+        exact.append((pt, dist))
+
+    exact.sort(key=lambda x: x[1])
+    final = exact[:final_top]
+    t3_end = time.time()
+
+    return {
+        "results": [pt for pt, _ in final],
+        "distances": [d for _, d in final],
+        "prefetch_count": len(prefetch_results),
+        "alpha_survivors": len(survivors),
+        "final_count": len(final),
+        "stage1_latency_ms": (t1_end - t1) * 1000,
+        "stage2_latency_ms": (t2_end - t2) * 1000,
+        "stage3_latency_ms": (t3_end - t3) * 1000,
+        "total_latency_ms": (t3_end - t_start) * 1000,
+    }
+
+
+def tangent_pipeline_query(
+    client,
+    collection,
+    query_poincare,
+    centroid,
+    curvature=1.0,
+    prune_factor=10,
+    final_top=10,
+    ef=128,
+):
+    """2-stage tangent pipeline: tangent HNSW (server) -> exact Poincare (client).
+
+    Uses Qdrant's native Euclidean HNSW on the "tangent" named vector for
+    approximate hyperbolic nearest-neighbor search.
+    """
+    t_start = time.time()
+
+    q_tangent = tangent_query(query_poincare, centroid, curvature)
+
+    # Stage 1: Tangent HNSW search (server-side Euclidean)
+    t1 = time.time()
+    tangent_limit = final_top * prune_factor
+    tangent_results = client.query_points(
+        collection_name=collection,
+        query=q_tangent.tolist(),
+        using="tangent",
+        with_payload=True,
+        with_vectors=["poincare"],
+        limit=tangent_limit,
+        search_params=SearchParams(hnsw_ef=ef),
+    ).points
+    t1_end = time.time()
+
+    if not tangent_results:
+        return {
+            "results": [], "distances": [],
+            "tangent_candidates": 0, "final_count": 0,
+            "stage1_latency_ms": 0, "stage2_latency_ms": 0,
+            "total_latency_ms": 0,
+        }
+
+    # Stage 2: Exact Poincare re-rank (client-side)
+    t2 = time.time()
+    exact = []
+    for pt in tangent_results:
+        cand_vec = np.array(pt.vector["poincare"])
+        diff_sq, u_sq, v_sq = fused_norms(query_poincare, cand_vec)
+        denom_u = max(1.0 - curvature * u_sq, 1e-7)
+        denom_v = max(1.0 - curvature * v_sq, 1e-7)
+        arg = 1.0 + 2.0 * curvature * diff_sq / (denom_u * denom_v)
+        dist = float(np.arccosh(max(arg, 1.0))) / np.sqrt(curvature)
+        exact.append((pt, dist))
+
+    exact.sort(key=lambda x: x[1])
+    final = exact[:final_top]
+    t2_end = time.time()
+
+    return {
+        "results": [pt for pt, _ in final],
+        "distances": [d for _, d in final],
+        "tangent_candidates": len(tangent_results),
+        "final_count": len(final),
+        "stage1_latency_ms": (t1_end - t1) * 1000,
+        "stage2_latency_ms": (t2_end - t2) * 1000,
+        "total_latency_ms": (t2_end - t_start) * 1000,
+    }
+
+
+def combined_pipeline_query(
+    client,
+    collection,
+    query_poincare,
+    centroid,
+    curvature=1.0,
+    cosine_limit=100,
+    tangent_limit=100,
+    alpha_top=50,
+    final_top=10,
+    ef=128,
+):
+    """Combined pipeline: cosine + tangent prefetch -> alpha re-rank -> exact Poincare.
+
+    Merges two independent retrieval signals (semantic similarity from cosine,
+    hierarchical proximity from tangent) before alpha re-ranking.
+    """
+    t_start = time.time()
+
+    # Stage 1a: Cosine prefetch (server)
+    cosine_results = client.query_points(
+        collection_name=collection,
+        query=query_poincare.tolist(),
+        using="dense",
+        with_payload=True,
+        with_vectors=["poincare"],
+        limit=cosine_limit,
+        search_params=SearchParams(hnsw_ef=ef),
+    ).points
+
+    # Stage 1b: Tangent prefetch (server)
+    q_tangent = tangent_query(query_poincare, centroid, curvature)
+    tangent_results = client.query_points(
+        collection_name=collection,
+        query=q_tangent.tolist(),
+        using="tangent",
+        with_payload=True,
+        with_vectors=["poincare"],
+        limit=tangent_limit,
+        search_params=SearchParams(hnsw_ef=ef),
+    ).points
+    t1_end = time.time()
+
+    # Merge + deduplicate by point ID
+    seen_ids = set()
+    merged = []
+    for pt in cosine_results + tangent_results:
+        if pt.id not in seen_ids:
+            seen_ids.add(pt.id)
+            merged.append(pt)
+
+    # Stage 2: Alpha re-rank (client, no acosh)
+    t2 = time.time()
+    query_alpha = alpha_precompute(query_poincare, curvature)
+    scored = []
+    for pt in merged:
+        cand_vec = np.array(pt.vector["poincare"])
+        cand_alpha = pt.payload.get("alpha")
+        if cand_alpha is None:
+            cand_alpha = alpha_precompute(cand_vec, curvature)
+        diff = query_poincare - cand_vec
+        diff_sq = float(np.dot(diff, diff))
+        proxy = diff_sq * query_alpha * cand_alpha
+        scored.append((pt, proxy))
+
+    scored.sort(key=lambda x: x[1])
+    survivors = scored[:alpha_top]
+    t2_end = time.time()
+
+    # Stage 3: Exact Poincare
+    t3 = time.time()
+    exact = []
+    for pt, proxy in survivors:
+        sqrt_c = np.sqrt(curvature)
+        arg = 1.0 + 2.0 * curvature * proxy
+        dist = float(np.arccosh(max(arg, 1.0))) / sqrt_c
+        exact.append((pt, dist))
+
+    exact.sort(key=lambda x: x[1])
+    final = exact[:final_top]
+    t3_end = time.time()
+
+    return {
+        "results": [pt for pt, _ in final],
+        "distances": [d for _, d in final],
+        "cosine_count": len(cosine_results),
+        "tangent_count": len(tangent_results),
+        "merged_count": len(merged),
+        "alpha_survivors": len(survivors),
+        "final_count": len(final),
+        "stage1_latency_ms": (t1_end - t_start) * 1000,
+        "stage2_latency_ms": (t2_end - t2) * 1000,
+        "stage3_latency_ms": (t3_end - t3) * 1000,
+        "total_latency_ms": (t3_end - t_start) * 1000,
+    }

@@ -592,6 +592,8 @@ impl CollectionParams {
                     on_disk,
                     datatype,
                     multivector_config,
+                    #[cfg(feature = "hyperbolic")]
+                    curvature,
                 } = params;
 
                 (
@@ -615,7 +617,7 @@ impl CollectionParams {
                         multivector_config: *multivector_config,
                         datatype: datatype.map(VectorStorageDatatype::from),
                         #[cfg(feature = "hyperbolic")]
-                        curvature: None,
+                        curvature: *curvature,
                     },
                 )
             })

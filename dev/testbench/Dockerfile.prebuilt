@@ -1,0 +1,17 @@
+FROM debian:13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata libunwind8 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /qdrant
+
+COPY qdrant_bin/qdrant /qdrant/qdrant
+COPY qdrant_config/ /qdrant/config
+COPY qdrant_entrypoint.sh /qdrant/entrypoint.sh
+
+ENV TZ=Etc/UTC RUN_MODE=production
+
+EXPOSE 6333 6334
+
+CMD ["./qdrant"]

@@ -454,6 +454,9 @@ pub struct VectorParams {
     /// Configuration for multi-vector search
     #[prost(message, optional, tag = "7")]
     pub multivector_config: ::core::option::Option<MultiVectorConfig>,
+    /// Poincare ball curvature for hyperbolic distance. Default: 1.0
+    #[prost(float, optional, tag = "8")]
+    pub curvature: ::core::option::Option<f32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]

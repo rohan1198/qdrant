@@ -1,3 +1,5 @@
+import math
+
 """Fusion strategies for dual-space search.
 
 Combines results from cosine and poincare search into a single ranking.
@@ -165,3 +167,91 @@ def depth_band_fuse(
     filtered_b = [r for r in results_b if _in_band(r)]
 
     return linear_alpha_fuse(filtered_a, filtered_b, alpha=alpha, limit=limit)
+
+
+def busemann_depth_proximity_fuse(
+    results_a: list,
+    results_b: list,
+    query_depth: float,
+    id_to_depth: dict[int, float],
+    alpha: float = 0.5,
+    depth_weight: float = 1.0,
+    limit: int = 10,
+) -> list[tuple[int, float]]:
+    """Busemann fusion with depth proximity weighting.
+
+    Enhanced version: results at the same hierarchy depth as the query are
+    weighted higher. Uses exponential decay based on Busemann depth distance.
+
+    Args:
+        results_a: first result set (e.g., cosine)
+        results_b: second result set (e.g., Poincare)
+        query_depth: Busemann depth of the query point
+        id_to_depth: mapping from point ID to Busemann depth
+        alpha: blend weight (0=all_b, 1=all_a)
+        depth_weight: steepness of depth proximity decay
+        limit: max results to return
+    """
+    ids_a, scores_a = _extract_scores(results_a)
+    ids_b, scores_b = _extract_scores(results_b)
+
+    norm_a = _min_max_normalize(scores_a)
+    norm_b = _min_max_normalize(scores_b)
+
+    score_map_a = dict(zip(ids_a, norm_a))
+    score_map_b = dict(zip(ids_b, norm_b))
+
+    all_ids = set(ids_a) | set(ids_b)
+    fused = []
+    for pid in all_ids:
+        sa = score_map_a.get(pid, 0.0)
+        sb = score_map_b.get(pid, 0.0)
+        cand_depth = id_to_depth.get(pid, query_depth)
+        depth_proximity = math.exp(-abs(cand_depth - query_depth) * depth_weight)
+        score = alpha * sa + (1.0 - alpha) * sb * depth_proximity
+        fused.append((pid, score))
+
+    fused.sort(key=lambda x: x[1], reverse=True)
+    return fused[:limit]
+
+
+def horosphere_score(
+    candidates: list[tuple[int, float]],
+    query_depth: float,
+    id_to_depth: dict[int, float],
+    intent: str = "auto",
+    steepness: float = 1.0,
+    limit: int = 10,
+) -> list[tuple[int, float]]:
+    """Re-weight candidates by horosphere (hierarchy depth) preference.
+
+    Horospheres are level sets of the Busemann function — hyperbolic "floors"
+    at a given depth.
+
+    Args:
+        candidates: list of (point_id, fused_score) tuples
+        query_depth: Busemann depth of the query point
+        id_to_depth: mapping from point ID to Busemann depth
+        intent: "ancestors" (prefer shallower), "descendants" (prefer deeper),
+                "siblings" (prefer same depth), "auto" (defaults to siblings)
+        steepness: how aggressively to penalize wrong-depth results
+        limit: max results to return
+    """
+    rescored = []
+    for pid, score in candidates:
+        cand_depth = id_to_depth.get(pid, query_depth)
+        depth_delta = cand_depth - query_depth
+
+        if intent == "ancestors":
+            horo_weight = math.exp(-max(depth_delta, 0.0) * steepness)
+        elif intent == "descendants":
+            horo_weight = math.exp(min(depth_delta, 0.0) * steepness)
+        elif intent in ("siblings", "auto"):
+            horo_weight = math.exp(-abs(depth_delta) * steepness)
+        else:
+            horo_weight = 1.0
+
+        rescored.append((pid, score * horo_weight))
+
+    rescored.sort(key=lambda x: x[1], reverse=True)
+    return rescored[:limit]

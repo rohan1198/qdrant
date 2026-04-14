@@ -30,6 +30,7 @@ from hyperbolic_math import (
     busemann_depth_single,
     compute_focal_direction,
     einstein_midpoint,
+    log_map_origin,
     poincare_to_klein_batch,
     poincare_to_klein,
 )
@@ -111,7 +112,7 @@ def _apply_dataset_config(dataset_name: str) -> None:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CURVATURE = 5.0
+CURVATURE = 0.25
 COSINE_COLLECTION = "wos_cosine"
 UNIFIED_COLLECTION = "wos_unified"
 VECTOR_DIM = 128
@@ -643,8 +644,9 @@ def create_unified_collection(
     name: str,
     size: int,
     curvature: float,
+    tangent_dim: int | None = None,
 ) -> None:
-    """Create a unified collection with dense + poincare named vectors."""
+    """Create a unified collection with dense + poincare + optional tangent named vectors."""
     import requests
 
     url = f"{qdrant_url}/collections/{name}"
@@ -652,21 +654,27 @@ def create_unified_collection(
     # Delete if exists
     requests.delete(url)
 
-    body = {
-        "vectors": {
-            "dense": {
-                "size": size,
-                "distance": "Cosine",
-                "hnsw_config": {"m": 16, "ef_construct": 200},
-            },
-            "poincare": {
-                "size": size,
-                "distance": "Poincare",
-                "hnsw_config": {"m": 16, "ef_construct": 200},
-                "curvature": curvature,
-            },
+    vectors_config = {
+        "dense": {
+            "size": size,
+            "distance": "Cosine",
+            "hnsw_config": {"m": 16, "ef_construct": 200},
+        },
+        "poincare": {
+            "size": size,
+            "distance": "Poincare",
+            "hnsw_config": {"m": 16, "ef_construct": 200},
+            "curvature": curvature,
         },
     }
+
+    if tangent_dim is not None:
+        vectors_config["tangent"] = {
+            "size": tangent_dim,
+            "distance": "Euclid",
+        }
+
+    body = {"vectors": vectors_config}
 
     resp = requests.put(url, json=body)
     if resp.status_code == 200:
@@ -693,10 +701,12 @@ def upsert_unified(
     alpha_values: np.ndarray | None = None,
     synthetic_timestamps: list[str] | None = None,
     klein_vectors: np.ndarray | None = None,
+    tangent_vectors: np.ndarray | None = None,
 ) -> None:
     """Upsert all three tiers into the unified collection."""
     from qdrant_client.models import PointStruct
     from hyperbolic_math import alpha_precompute_batch
+    from tangent import compute_tangent_coords
 
     # --- Content tier ---
     print(f"  Upserting {len(content_docs)} content points ...")
@@ -721,12 +731,16 @@ def upsert_unified(
             # Timestamp
             ts = synthetic_timestamps[i] if synthetic_timestamps else None
 
-            points.append(PointStruct(
-                id=CONTENT_ID_OFFSET + i,
-                vector={
+            vec_dict = {
                     "dense": cosine_vectors[i].tolist(),
                     "poincare": poincare_vectors[i].tolist(),
-                },
+            }
+            if tangent_vectors is not None:
+                vec_dict["tangent"] = tangent_vectors[i].tolist()
+
+            points.append(PointStruct(
+                id=CONTENT_ID_OFFSET + i,
+                vector=vec_dict,
                 payload={
                     "tier": "content",
                     "item_type": "content",
@@ -772,12 +786,17 @@ def upsert_unified(
             if idx < len(content_docs)
         ]
 
+        story_vec = {
+            "dense": entry["cosine"].tolist(),
+            "poincare": entry["poincare"].tolist(),
+        }
+        if tangent_vectors is not None:
+            tv = log_map_origin(entry["poincare"], CURVATURE)
+            story_vec["tangent"] = tv.astype(np.float32).tolist()
+
         story_points.append(PointStruct(
             id=entry["id"],
-            vector={
-                "dense": entry["cosine"].tolist(),
-                "poincare": entry["poincare"].tolist(),
-            },
+            vector=story_vec,
             payload={
                 "tier": "story",
                 "item_type": "story",
@@ -825,12 +844,17 @@ def upsert_unified(
             if ae["id"] in entry["source_ids"]
         ]
 
+        narr_vec = {
+            "dense": entry["cosine"].tolist(),
+            "poincare": entry["poincare"].tolist(),
+        }
+        if tangent_vectors is not None:
+            tv = log_map_origin(entry["poincare"], CURVATURE)
+            narr_vec["tangent"] = tv.astype(np.float32).tolist()
+
         narrative_points.append(PointStruct(
             id=entry["id"],
-            vector={
-                "dense": entry["cosine"].tolist(),
-                "poincare": entry["poincare"].tolist(),
-            },
+            vector=narr_vec,
             payload={
                 "tier": "narrative",
                 "item_type": "narrative",
@@ -948,8 +972,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--qdrant-url",
-        default="http://localhost:6334",
-        help="Qdrant REST API URL (default: http://localhost:6334)",
+        default="http://localhost:6333",
+        help="Qdrant REST API URL (default: http://localhost:6333)",
     )
     parser.add_argument(
         "--skip-embed",
@@ -1097,6 +1121,15 @@ def main() -> None:
     klein_vectors = poincare_to_klein_batch(poincare_vectors, c=CURVATURE)
     print(f"  Klein vectors: shape={klein_vectors.shape}")
 
+    # Tangent coordinate precomputation (origin centroid — cheapest, no Mobius ops)
+    from tangent import compute_tangent_coords
+    tangent_vectors = compute_tangent_coords(
+        [poincare_vectors[i] for i in range(len(poincare_vectors))],
+        centroid=np.zeros(VECTOR_DIM),
+        curvature=CURVATURE,
+    )
+    print(f"  Tangent vectors: shape={tangent_vectors.shape}")
+
     # Gromov delta analysis
     gromov_result = run_gromov_analysis(poincare_vectors, args.dataset)
 
@@ -1135,7 +1168,7 @@ def main() -> None:
 
         # Unified collection
         print("\nCreating unified collection ...")
-        create_unified_collection(qdrant_url, UNIFIED_COLLECTION, size=VECTOR_DIM, curvature=CURVATURE)
+        create_unified_collection(qdrant_url, UNIFIED_COLLECTION, size=VECTOR_DIM, curvature=CURVATURE, tangent_dim=VECTOR_DIM)
         upsert_unified(
             client, UNIFIED_COLLECTION,
             docs, embeddings_128, poincare_vectors, busemann_depths,
@@ -1143,6 +1176,7 @@ def main() -> None:
             alpha_values=alpha_values,
             synthetic_timestamps=synthetic_timestamps,
             klein_vectors=klein_vectors,
+            tangent_vectors=tangent_vectors,
         )
 
         # Create payload indices for server-side filtering

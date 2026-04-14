@@ -198,6 +198,8 @@ pub fn build_segment_optimizer_config(
                 on_disk,
                 datatype,
                 multivector_config,
+                #[cfg(feature = "hyperbolic")]
+                curvature: _,
             } = params;
 
             (
