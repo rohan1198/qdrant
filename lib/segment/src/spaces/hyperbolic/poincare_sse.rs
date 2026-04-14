@@ -11,11 +11,9 @@ use super::poincare_math::{stable_acosh, EPS};
 #[target_feature(enable = "sse")]
 #[allow(clippy::missing_safety_doc)]
 unsafe fn hsum128_ps_sse(v: __m128) -> f32 {
-    unsafe {
-        let x64: __m128 = _mm_add_ps(v, _mm_movehl_ps(v, v));
-        let x32: __m128 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
-        _mm_cvtss_f32(x32)
-    }
+    let x64: __m128 = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    let x32: __m128 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
+    _mm_cvtss_f32(x32)
 }
 
 /// SSE-accelerated Poincaré similarity.

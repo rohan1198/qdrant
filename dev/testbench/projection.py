@@ -238,3 +238,20 @@ STRATEGIES = {
     "einstein": project_einstein,
     "einstein_spread": project_einstein_spread,
 }
+
+
+def auto_curvature(delta: float) -> float:
+    """Select Poincare ball curvature from Gromov delta.
+
+    Thresholds are initial estimates — Suite 15 (Curvature Sweep) will
+    empirically determine optimal breakpoints on BGC and HWV.
+
+    Lower delta = more tree-like = higher curvature (tighter ball).
+    """
+    if delta < 0.10:
+        return 2.0
+    if delta < 0.20:
+        return 1.0
+    if delta < 0.35:
+        return 0.5
+    return 0.25

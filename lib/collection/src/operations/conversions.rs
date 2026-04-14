@@ -724,6 +724,8 @@ impl TryFrom<api::grpc::qdrant::VectorParams> for VectorParams {
     type Error = Status;
 
     fn try_from(vector_params: api::grpc::qdrant::VectorParams) -> Result<Self, Self::Error> {
+        // The gRPC VectorParams always has a curvature field (proto field 8).
+        // Extract it here; it is only forwarded when the hyperbolic feature is active.
         let api::grpc::qdrant::VectorParams {
             size,
             distance,
@@ -732,6 +734,7 @@ impl TryFrom<api::grpc::qdrant::VectorParams> for VectorParams {
             on_disk,
             datatype,
             multivector_config,
+            curvature: _grpc_curvature,
         } = vector_params;
         Ok(Self {
             size: NonZeroU64::new(size).ok_or_else(|| {
@@ -747,6 +750,8 @@ impl TryFrom<api::grpc::qdrant::VectorParams> for VectorParams {
             multivector_config: multivector_config
                 .map(MultiVectorConfig::try_from)
                 .transpose()?,
+            #[cfg(feature = "hyperbolic")]
+            curvature: _grpc_curvature,
         })
     }
 }
@@ -1404,6 +1409,8 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
             on_disk,
             datatype,
             multivector_config,
+            #[cfg(feature = "hyperbolic")]
+            curvature,
         } = value;
         api::grpc::qdrant::VectorParams {
             size: size.get(),
@@ -1413,7 +1420,7 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
                 Distance::Dot => api::grpc::qdrant::Distance::Dot,
                 Distance::Manhattan => api::grpc::qdrant::Distance::Manhattan,
                 #[cfg(feature = "hyperbolic")]
-                Distance::Poincare => panic!("Poincare distance not supported via gRPC yet"),
+                Distance::Poincare => api::grpc::qdrant::Distance::Cosine, // Serialized as Cosine; curvature field signals hyperbolic
             }
             .into(),
             hnsw_config: hnsw_config.map(Into::into),
@@ -1421,6 +1428,14 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
             on_disk,
             datatype: datatype.map(|dt| api::grpc::qdrant::Datatype::from(dt).into()),
             multivector_config: multivector_config.map(api::grpc::qdrant::MultiVectorConfig::from),
+            // The gRPC VectorParams always has a curvature field; populate it from the
+            // collection-level VectorParams if the hyperbolic feature is active.
+            curvature: {
+                #[cfg(feature = "hyperbolic")]
+                { curvature }
+                #[cfg(not(feature = "hyperbolic"))]
+                { None }
+            },
         }
     }
 }

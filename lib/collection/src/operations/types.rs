@@ -1413,8 +1413,12 @@ impl From<Datatype> for VectorStorageDatatype {
 }
 
 /// Params of single vector data storage
+#[cfg_attr(
+    not(feature = "hyperbolic"),
+    derive(Hash, Eq)
+)]
 #[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq, Eq,
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq,
 )]
 #[serde(rename_all = "snake_case")]
 #[anonymize(false)]
@@ -1455,7 +1459,31 @@ pub struct VectorParams {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multivector_config: Option<MultiVectorConfig>,
+
+    /// Poincaré ball curvature for hyperbolic distance. Only used when distance is Poincare.
+    /// Default: 1.0
+    #[cfg(feature = "hyperbolic")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curvature: Option<f32>,
 }
+
+#[cfg(feature = "hyperbolic")]
+impl std::hash::Hash for VectorParams {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.size.hash(state);
+        self.distance.hash(state);
+        self.hnsw_config.hash(state);
+        self.quantization_config.hash(state);
+        self.on_disk.hash(state);
+        self.datatype.hash(state);
+        self.multivector_config.hash(state);
+        // Hash f32 via its bit representation to satisfy Hash trait
+        self.curvature.map(f32::to_bits).hash(state);
+    }
+}
+
+#[cfg(feature = "hyperbolic")]
+impl Eq for VectorParams {}
 
 /// Validate the value is in `[1, 65536]` or `None`.
 pub fn validate_nonzerou64_range_min_1_max_65536(
@@ -1752,6 +1780,8 @@ impl From<&VectorParams> for VectorParamsBase {
             on_disk: _,
             datatype: _,
             multivector_config: _,
+            #[cfg(feature = "hyperbolic")]
+            curvature: _,
         } = params;
         Self {
             size: size.get() as _, // TODO!?

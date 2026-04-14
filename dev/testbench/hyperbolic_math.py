@@ -370,3 +370,118 @@ def incone_filter(candidates, axis, aperture, origin=None):
         if angle <= aperture:
             result.append(cand)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Logarithmic maps and Frechet mean
+# ---------------------------------------------------------------------------
+
+def log_map_origin(p: np.ndarray, c: float = 1.0) -> np.ndarray:
+    """Logarithmic map at the origin (fast path, no Mobius ops).
+
+    Formula: log_0(p) = (1/sqrt(c)) * arctanh(sqrt(c) * ||p||) * p / ||p||
+
+    At the origin lambda_p = 2 and Mobius addition simplifies to identity,
+    so the general log_map formula reduces to (2/(sc*lambda_p)) = (2/(sc*2))
+    = 1/sc.  ~3x cheaper than general log_map.
+    """
+    sc = np.sqrt(c)
+    norm = np.linalg.norm(p)
+    if norm < EPS:
+        return np.zeros_like(p)
+    sc_norm = min(sc * norm, 1.0 - EPS)  # clamp for arctanh domain
+    coeff = (1.0 / sc) * np.arctanh(sc_norm) / norm
+    return p * coeff
+
+
+def log_map(base: np.ndarray, target: np.ndarray, c: float = 1.0) -> np.ndarray:
+    """Logarithmic map at arbitrary base point.
+
+    Formula: log_p(y) = (2/(sqrt(c)*lambda_p)) * arctanh(sqrt(c)*||-p +_c y||)
+                        * (-p +_c y) / ||-p +_c y||
+    """
+    sc = np.sqrt(c)
+
+    # Mobius negation + addition: -p +_c y
+    neg_p = -base
+    neg_p_sq = np.dot(neg_p, neg_p)
+    y_sq = np.dot(target, target)
+    neg_p_dot_y = np.dot(neg_p, target)
+
+    num_left = (1.0 + 2.0 * c * neg_p_dot_y + c * y_sq)
+    num_right = (1.0 - c * neg_p_sq)
+    denom = 1.0 + 2.0 * c * neg_p_dot_y + c**2 * neg_p_sq * y_sq
+    denom = max(denom, EPS)
+
+    add = (num_left * neg_p + num_right * target) / denom
+
+    add_norm = np.linalg.norm(add)
+    if add_norm < EPS:
+        return np.zeros_like(base)
+
+    base_sq = np.dot(base, base)
+    lambda_p = 2.0 / max(1.0 - c * base_sq, EPS)
+
+    sc_add_norm = min(sc * add_norm, 1.0 - EPS)
+    coeff = (2.0 / (sc * lambda_p)) * np.arctanh(sc_add_norm) / add_norm
+
+    return add * coeff
+
+
+def frechet_mean(points: list[np.ndarray], c: float = 1.0,
+                 max_iter: int = 100, lr: float = 0.1, tol: float = 1e-6) -> np.ndarray:
+    """Iterative Frechet mean on the Poincare ball via Riemannian gradient descent."""
+    dim = len(points[0])
+    n = len(points)
+
+    mean = np.mean(points, axis=0)
+    mean = project_to_ball(mean, c)
+
+    for _ in range(max_iter):
+        grad = np.zeros(dim)
+        for p in points:
+            lm = log_map(mean, p, c)
+            grad += lm
+        grad /= n
+
+        grad_norm = np.linalg.norm(grad)
+        if grad_norm < tol:
+            break
+
+        step = grad * lr
+        mean = _exp_map_at(mean, step, c)
+        mean = project_to_ball(mean, c)
+
+    return mean
+
+
+def _exp_map_at(base: np.ndarray, v: np.ndarray, c: float = 1.0) -> np.ndarray:
+    """Exponential map at arbitrary base point (tangent vector v -> manifold)."""
+    sc = np.sqrt(c)
+    v_norm = np.linalg.norm(v)
+    if v_norm < EPS:
+        return base.copy()
+
+    base_sq = np.dot(base, base)
+    lambda_p = 2.0 / max(1.0 - c * base_sq, EPS)
+
+    tanh_arg = sc * lambda_p * v_norm / 2.0
+    direction = v / v_norm
+    second = np.tanh(tanh_arg) * direction / sc
+
+    b_sq = np.dot(base, base)
+    s_sq = np.dot(second, second)
+    b_dot_s = np.dot(base, second)
+
+    num_left = (1.0 + 2.0 * c * b_dot_s + c * s_sq)
+    num_right = (1.0 - c * b_sq)
+    denom = 1.0 + 2.0 * c * b_dot_s + c**2 * b_sq * s_sq
+    denom = max(denom, EPS)
+
+    return (num_left * base + num_right * second) / denom
+
+
+def tangent_distance_sq(u: np.ndarray, v: np.ndarray) -> float:
+    """Euclidean L2 squared distance between tangent space vectors."""
+    diff = u - v
+    return float(np.dot(diff, diff))

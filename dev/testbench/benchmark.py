@@ -32,7 +32,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import SearchParams
 from tqdm import tqdm
 
-from fusion import rrf_fuse
+from scipy import stats as scipy_stats
+
+from comparator import compute_recall_at_k, compute_rank_correlation, compare_report
+from fusion import rrf_fuse, linear_alpha_fuse, busemann_depth_proximity_fuse, horosphere_score
 from hyperbolic_math import (
     EPS,
     busemann_depth_single,
@@ -41,19 +44,26 @@ from hyperbolic_math import (
     einstein_midpoint,
     gromov_delta,
 )
+from pipeline_config import PipelineConfig, PHASE5_BASELINE, ALPHA_PIPELINE, TANGENT_PIPELINE
+from projection import auto_curvature
 from queries import (
+    alpha_pipeline_query,
+    combined_pipeline_query,
     cross_branch_query,
     depth_band_query,
     drill_down_query,
+    klein_prefilter_query,
     lateral_query,
+    tangent_pipeline_query,
 )
+from tangent import compute_centroid, compute_tangent_coords, tangent_query
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 EF_VALUES = [64, 128, 256]
-DEFAULT_CURVATURE = 5.0
+DEFAULT_CURVATURE = 0.25
 
 UNIFIED_COLLECTION = "wos_unified"
 CONTENT_ID_OFFSET = 0
@@ -1157,6 +1167,12 @@ class BenchmarkRunner:
         self.suite_quantization_recall()
         self.suite_klein_prefilter()
         self.suite_geometric_filters()
+        self.suite_alpha_vs_klein()
+        self.suite_tangent_centroid()
+        self.suite_prune_factor_sweep()
+        self.suite_curvature_sweep()
+        self.suite_fusion_comparison()
+        self.suite_end_to_end()
 
         return self.results
 
@@ -2063,6 +2079,423 @@ class BenchmarkRunner:
             self.results["geometric_filters"] = {"error": str(e)}
             print(f"  ERROR: {e}")
 
+    # ------------------------------------------------------------------
+    # Brute-force ground truth helper
+    # ------------------------------------------------------------------
+
+    def _brute_force_poincare_gt(self, query_vec, all_vecs, all_ids, k=10, exclude_id=None):
+        """Compute brute-force Poincare nearest neighbors (ground truth).
+
+        Excludes the query point itself (by ID or by zero distance) to ensure
+        ground truth contains only *other* points.
+        """
+        dists = []
+        u_sq = float(np.dot(query_vec, query_vec))
+        for i, v in enumerate(all_vecs):
+            if exclude_id is not None and all_ids[i] == exclude_id:
+                continue
+            diff = query_vec - v
+            diff_sq = float(np.dot(diff, diff))
+            if diff_sq < 1e-12:  # skip self-match
+                continue
+            v_sq = float(np.dot(v, v))
+            denom = max((1 - self.curvature * u_sq) * (1 - self.curvature * v_sq), 1e-9)
+            arg = 1.0 + 2.0 * self.curvature * diff_sq / denom
+            d = float(np.arccosh(max(arg, 1.0))) / np.sqrt(self.curvature)
+            dists.append((all_ids[i], d))
+        dists.sort(key=lambda x: x[1])
+        return [pid for pid, _ in dists[:k]]
+
+    # ------------------------------------------------------------------
+    # Suite 12: Alpha vs Klein
+    # ------------------------------------------------------------------
+
+    def suite_alpha_vs_klein(self, num_queries: int = 50) -> dict:
+        """Suite 12: Alpha pipeline vs Klein pipeline."""
+        print("\n=== Suite 12: Alpha vs Klein ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = np.array([p["vector"] for p in points])
+        all_ids = [p["id"] for p in points]
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        alpha_recalls, klein_recalls = [], []
+        alpha_latencies, klein_latencies = [], []
+        rank_correlations = []
+
+        for qi in tqdm(query_indices, desc="Alpha vs Klein"):
+            query_vec = all_vecs[qi]
+            gt_ids = self._brute_force_poincare_gt(query_vec, all_vecs, all_ids, k=10, exclude_id=all_ids[qi])
+
+            try:
+                alpha_res = alpha_pipeline_query(
+                    self.client, self.unified_collection, query_vec,
+                    curvature=self.curvature, prefetch_limit=200, alpha_top=50, final_top=10,
+                )
+                alpha_ids = [r.id for r in alpha_res["results"]]
+                alpha_recalls.append(compute_recall_at_k(alpha_ids, gt_ids, 10))
+                alpha_latencies.append(alpha_res["stage2_latency_ms"])
+                rank_correlations.append(compute_rank_correlation(alpha_ids, gt_ids))
+            except Exception as e:
+                print(f"  Alpha query failed: {e}")
+
+            try:
+                klein_res = klein_prefilter_query(
+                    self.client, self.unified_collection, query_vec,
+                    curvature=self.curvature, prefetch_limit=200, klein_top=50, final_top=10,
+                )
+                klein_ids = [r.id for r in klein_res["results"]]
+                klein_recalls.append(compute_recall_at_k(klein_ids, gt_ids, 10))
+                klein_latencies.append(klein_res["stage2_latency_ms"])
+            except Exception as e:
+                print(f"  Klein query failed: {e}")
+
+        result = {
+            "suite": "alpha_vs_klein",
+            "num_queries": len(query_indices),
+            "alpha_recall_mean": float(np.mean(alpha_recalls)) if alpha_recalls else 0,
+            "klein_recall_mean": float(np.mean(klein_recalls)) if klein_recalls else 0,
+            "alpha_stage2_latency_ms": float(np.mean(alpha_latencies)) if alpha_latencies else 0,
+            "klein_stage2_latency_ms": float(np.mean(klein_latencies)) if klein_latencies else 0,
+            "rank_correlation_mean": float(np.mean(rank_correlations)) if rank_correlations else 0,
+        }
+        print(f"  Alpha recall: {result['alpha_recall_mean']:.3f}, Klein recall: {result['klein_recall_mean']:.3f}")
+        print(f"  Alpha latency: {result['alpha_stage2_latency_ms']:.1f}ms, Klein latency: {result['klein_stage2_latency_ms']:.1f}ms")
+        print(f"  Rank correlation: {result['rank_correlation_mean']:.3f}")
+        self.results["alpha_vs_klein"] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Suite 13: Tangent Centroid Comparison
+    # ------------------------------------------------------------------
+
+    def suite_tangent_centroid(self, num_queries: int = 50) -> dict:
+        """Suite 13: Tangent centroid comparison (origin vs frechet vs einstein)."""
+        print("\n=== Suite 13: Tangent Centroid Comparison ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = [np.array(p["vector"]) for p in points]
+        all_ids = [p["id"] for p in points]
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        results_by_strategy = {}
+        for strategy in ["origin", "frechet", "einstein"]:
+            print(f"  Testing centroid: {strategy}")
+            t_cent = time.time()
+            centroid = compute_centroid(all_vecs, strategy, self.curvature)
+            centroid_time = time.time() - t_cent
+
+            recalls = []
+            correlations = []
+            for qi in tqdm(query_indices, desc=f"  {strategy}"):
+                gt_ids = self._brute_force_poincare_gt(all_vecs[qi], all_vecs, all_ids, k=10, exclude_id=all_ids[qi])
+                try:
+                    res = tangent_pipeline_query(
+                        self.client, self.unified_collection, all_vecs[qi], centroid,
+                        curvature=self.curvature, prune_factor=10, final_top=10,
+                    )
+                    ret_ids = [r.id for r in res["results"]]
+                    recalls.append(compute_recall_at_k(ret_ids, gt_ids, 10))
+                    correlations.append(compute_rank_correlation(ret_ids, gt_ids))
+                except Exception as e:
+                    print(f"    Query failed: {e}")
+
+            results_by_strategy[strategy] = {
+                "recall_mean": float(np.mean(recalls)) if recalls else 0,
+                "rank_correlation": float(np.mean(correlations)) if correlations else 0,
+                "centroid_time_s": centroid_time,
+            }
+            print(f"    Recall: {results_by_strategy[strategy]['recall_mean']:.3f}, "
+                  f"Correlation: {results_by_strategy[strategy]['rank_correlation']:.3f}, "
+                  f"Centroid time: {centroid_time:.2f}s")
+
+        result = {"suite": "tangent_centroid", "strategies": results_by_strategy}
+        self.results["tangent_centroid"] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Suite 14: Prune Factor Sweep
+    # ------------------------------------------------------------------
+
+    def suite_prune_factor_sweep(self, num_queries: int = 50) -> dict:
+        """Suite 14: Tangent prune factor sweep (5, 10, 20)."""
+        print("\n=== Suite 14: Prune Factor Sweep ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = [np.array(p["vector"]) for p in points]
+        all_ids = [p["id"] for p in points]
+        centroid = np.zeros(len(all_vecs[0]))
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        results_by_factor = {}
+        for pf in [5, 10, 20]:
+            recalls = []
+            exact_count = pf * 10
+            for qi in tqdm(query_indices, desc=f"  pf={pf}"):
+                gt_ids = self._brute_force_poincare_gt(all_vecs[qi], all_vecs, all_ids, k=10, exclude_id=all_ids[qi])
+                try:
+                    res = tangent_pipeline_query(
+                        self.client, self.unified_collection, all_vecs[qi], centroid,
+                        curvature=self.curvature, prune_factor=pf, final_top=10,
+                    )
+                    ret_ids = [r.id for r in res["results"]]
+                    recalls.append(compute_recall_at_k(ret_ids, gt_ids, 10))
+                except Exception as e:
+                    print(f"    Query failed: {e}")
+
+            results_by_factor[str(pf)] = {
+                "recall_mean": float(np.mean(recalls)) if recalls else 0,
+                "exact_dist_computations": exact_count,
+            }
+            print(f"  pf={pf}: recall={results_by_factor[str(pf)]['recall_mean']:.3f}, "
+                  f"exact_comps={exact_count}")
+
+        result = {"suite": "prune_factor_sweep", "factors": results_by_factor}
+        self.results["prune_factor_sweep"] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Suite 15: Curvature Sweep
+    # ------------------------------------------------------------------
+
+    def suite_curvature_sweep(self, num_queries: int = 50) -> dict:
+        """Suite 15: Curvature sweep across c = 0.25, 0.5, 1.0, 2.0, 5.0.
+
+        Measures same-tier precision (what fraction of top-10 Poincare nearest
+        neighbors share the query's tier) and hierarchy separation (average
+        distance between tiers vs within tiers). These metrics work even with
+        heavily skewed tier distributions (e.g., BGC: 92K content, 44 story, 7 narrative).
+        """
+        print("\n=== Suite 15: Curvature Sweep ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = np.array([p["vector"] for p in points])
+        all_ids = [p["id"] for p in points]
+        tiers = [p.get("tier", "unknown") for p in points]
+        busemann = [p.get("busemann_depth", 0.0) for p in points]
+
+        # Tier distribution
+        tier_counts = {}
+        for t in tiers:
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        print(f"  Tier distribution: {tier_counts}")
+
+        delta, rec = gromov_delta(all_vecs, num_samples=1000)
+        print(f"  Gromov delta: {delta:.4f} (recommendation: {rec})")
+        print(f"  auto_curvature suggests: c={auto_curvature(delta)}")
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        results_by_c = {}
+        for c in [0.25, 0.5, 1.0, 2.0, 5.0]:
+            same_tier_precisions = []
+            depth_separations = []
+
+            for qi in query_indices:
+                query_vec = all_vecs[qi]
+                query_tier = tiers[qi]
+                query_depth = busemann[qi]
+
+                # Brute-force Poincare top-10 at this curvature
+                dists = []
+                for i in range(len(all_vecs)):
+                    if i == qi:
+                        continue
+                    diff = query_vec - all_vecs[i]
+                    diff_sq = float(np.dot(diff, diff))
+                    u_sq = float(np.dot(query_vec, query_vec))
+                    v_sq = float(np.dot(all_vecs[i], all_vecs[i]))
+                    denom = max((1 - c * u_sq) * (1 - c * v_sq), 1e-9)
+                    arg = 1.0 + 2.0 * c * diff_sq / denom
+                    d = float(np.arccosh(max(arg, 1.0))) / np.sqrt(c)
+                    dists.append((i, d))
+                dists.sort(key=lambda x: x[1])
+                top10 = dists[:10]
+
+                # Same-tier precision: fraction of top-10 with same tier
+                same_count = sum(1 for idx, _ in top10 if tiers[idx] == query_tier)
+                same_tier_precisions.append(same_count / 10.0)
+
+                # Depth coherence: avg depth distance to top-10 neighbors
+                depth_dists = [abs(busemann[idx] - query_depth) for idx, _ in top10]
+                depth_separations.append(float(np.mean(depth_dists)))
+
+            results_by_c[str(c)] = {
+                "same_tier_precision": float(np.mean(same_tier_precisions)),
+                "avg_depth_coherence": float(np.mean(depth_separations)),
+                "num_queries": len(query_indices),
+            }
+            print(f"  c={c}: same_tier_prec={results_by_c[str(c)]['same_tier_precision']:.3f}, "
+                  f"depth_coherence={results_by_c[str(c)]['avg_depth_coherence']:.4f}")
+
+        result = {
+            "suite": "curvature_sweep",
+            "gromov_delta": delta,
+            "auto_curvature": auto_curvature(delta),
+            "tier_distribution": tier_counts,
+            "curvatures": results_by_c,
+        }
+        self.results["curvature_sweep"] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Suite 16: Fusion Comparison
+    # ------------------------------------------------------------------
+
+    def suite_fusion_comparison(self, num_queries: int = 50) -> dict:
+        """Suite 16: Fusion strategy comparison with recall metrics."""
+        print("\n=== Suite 16: Fusion Comparison ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = np.array([p["vector"] for p in points])
+        all_ids = [p["id"] for p in points]
+        id_to_depth = {p["id"]: p.get("busemann_depth", 0.0) for p in points}
+        id_to_tier = {p["id"]: p.get("tier", "content") for p in points}
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        strategy_names = ["rrf", "linear_alpha", "busemann", "horo_siblings", "horo_ancestors", "horo_descendants"]
+        strategy_recalls = {s: [] for s in strategy_names}
+        strategy_same_tier = {s: [] for s in strategy_names}
+
+        for qi in tqdm(query_indices, desc="Fusion comparison"):
+            query_vec = all_vecs[qi]
+            query_depth = id_to_depth.get(all_ids[qi], 0.0)
+            query_tier = id_to_tier.get(all_ids[qi], "content")
+
+            # Brute-force ground truth
+            gt_ids = self._brute_force_poincare_gt(query_vec, all_vecs, all_ids, k=10, exclude_id=all_ids[qi])
+
+            try:
+                cosine_res = self.client.query_points(
+                    collection_name=self.unified_collection,
+                    query=query_vec.tolist(), using="dense",
+                    with_payload=True, limit=50,
+                ).points
+                poincare_res = self.client.query_points(
+                    collection_name=self.unified_collection,
+                    query=query_vec.tolist(), using="poincare",
+                    with_payload=True, limit=50,
+                ).points
+            except Exception as e:
+                print(f"  Query failed: {e}")
+                continue
+
+            if not cosine_res or not poincare_res:
+                continue
+
+            # Run all fusion strategies
+            fused = {}
+            fused["rrf"] = rrf_fuse(cosine_res, poincare_res, limit=10)
+            fused["linear_alpha"] = linear_alpha_fuse(cosine_res, poincare_res, alpha=0.5, limit=10)
+            busemann_result = busemann_depth_proximity_fuse(
+                cosine_res, poincare_res, query_depth, id_to_depth, alpha=0.5, depth_weight=1.0, limit=10,
+            )
+            fused["busemann"] = busemann_result
+            fused["horo_siblings"] = horosphere_score(busemann_result, query_depth, id_to_depth, intent="siblings", limit=10)
+            fused["horo_ancestors"] = horosphere_score(busemann_result, query_depth, id_to_depth, intent="ancestors", limit=10)
+            fused["horo_descendants"] = horosphere_score(busemann_result, query_depth, id_to_depth, intent="descendants", limit=10)
+
+            # Compute recall and same-tier precision per strategy
+            for name, result_list in fused.items():
+                result_ids = [pid for pid, _ in result_list]
+                recall = compute_recall_at_k(result_ids, gt_ids, 10)
+                same_tier = sum(1 for pid in result_ids if id_to_tier.get(pid) == query_tier) / max(len(result_ids), 1)
+                strategy_recalls[name].append(recall)
+                strategy_same_tier[name].append(same_tier)
+
+        result = {"suite": "fusion_comparison", "strategies": {}}
+        for name in strategy_names:
+            recalls = strategy_recalls[name]
+            tiers = strategy_same_tier[name]
+            result["strategies"][name] = {
+                "recall_mean": float(np.mean(recalls)) if recalls else 0,
+                "same_tier_precision": float(np.mean(tiers)) if tiers else 0,
+                "num_queries": len(recalls),
+            }
+            print(f"  {name}: recall={result['strategies'][name]['recall_mean']:.3f}, "
+                  f"same_tier={result['strategies'][name]['same_tier_precision']:.3f}")
+
+        self.results["fusion_comparison"] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Suite 17: End-to-End Pipeline
+    # ------------------------------------------------------------------
+
+    def suite_end_to_end(self, num_queries: int = 50) -> dict:
+        """Suite 17: End-to-end pipeline comparison (Phase 6 vs Phase 5 baseline)."""
+        print("\n=== Suite 17: End-to-End Pipeline ===")
+        points = self._load_unified_points("poincare")
+        if not points:
+            return {"error": "no points"}
+
+        all_vecs = np.array([p["vector"] for p in points])
+        all_ids = [p["id"] for p in points]
+
+        rng = np.random.default_rng(42)
+        query_indices = rng.choice(len(points), min(num_queries, len(points)), replace=False)
+
+        baseline_recalls, baseline_latencies = [], []
+        alpha_recalls, alpha_latencies = [], []
+
+        for qi in tqdm(query_indices, desc="End-to-end"):
+            query_vec = all_vecs[qi]
+            gt_ids = self._brute_force_poincare_gt(query_vec, all_vecs, all_ids, k=10, exclude_id=all_ids[qi])
+
+            try:
+                klein_res = klein_prefilter_query(
+                    self.client, self.unified_collection, query_vec,
+                    curvature=self.curvature, prefetch_limit=200, klein_top=50, final_top=10,
+                )
+                klein_ids = [r.id for r in klein_res["results"]]
+                baseline_recalls.append(compute_recall_at_k(klein_ids, gt_ids, 10))
+                baseline_latencies.append(klein_res["total_latency_ms"])
+            except Exception as e:
+                print(f"  Klein failed: {e}")
+
+            try:
+                alpha_res = alpha_pipeline_query(
+                    self.client, self.unified_collection, query_vec,
+                    curvature=self.curvature, prefetch_limit=200, alpha_top=50, final_top=10,
+                )
+                alpha_ids = [r.id for r in alpha_res["results"]]
+                alpha_recalls.append(compute_recall_at_k(alpha_ids, gt_ids, 10))
+                alpha_latencies.append(alpha_res["total_latency_ms"])
+            except Exception as e:
+                print(f"  Alpha failed: {e}")
+
+        result = {
+            "suite": "end_to_end",
+            "num_queries": len(query_indices),
+            "baseline_klein_recall": float(np.mean(baseline_recalls)) if baseline_recalls else 0,
+            "phase6_alpha_recall": float(np.mean(alpha_recalls)) if alpha_recalls else 0,
+            "baseline_klein_latency_ms": float(np.mean(baseline_latencies)) if baseline_latencies else 0,
+            "phase6_alpha_latency_ms": float(np.mean(alpha_latencies)) if alpha_latencies else 0,
+        }
+        print(f"  Baseline (Klein): recall={result['baseline_klein_recall']:.3f}, latency={result['baseline_klein_latency_ms']:.1f}ms")
+        print(f"  Phase 6 (Alpha):  recall={result['phase6_alpha_recall']:.3f}, latency={result['phase6_alpha_latency_ms']:.1f}ms")
+        self.results["end_to_end"] = result
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -2075,8 +2508,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--qdrant-url",
-        default="http://localhost:6334",
-        help="Qdrant gRPC/HTTP URL (default: http://localhost:6334)",
+        default="http://localhost:6333",
+        help="Qdrant REST URL (default: http://localhost:6333)",
     )
     parser.add_argument(
         "--dataset",
@@ -2091,13 +2524,15 @@ def main() -> None:
         help="Run specific suites (default: all). "
              "Options: gromov_delta, hierarchy_separation, drill_down, lateral, "
              "cross_branch, depth_band, unified_vs_separate, latency, "
-             "quantization_recall, klein_prefilter, geometric_filters",
+             "quantization_recall, klein_prefilter, geometric_filters, "
+             "alpha_vs_klein, tangent_centroid, prune_factor_sweep, "
+             "curvature_sweep, fusion_comparison, end_to_end",
     )
     parser.add_argument(
         "--curvature",
         type=float,
-        default=5.0,
-        help="Poincare ball curvature (default: 5.0)",
+        default=DEFAULT_CURVATURE,
+        help=f"Poincare ball curvature (default: {DEFAULT_CURVATURE})",
     )
     args = parser.parse_args()
 
@@ -2117,7 +2552,9 @@ def main() -> None:
                 print(f"Unknown suite: {suite_name}")
                 print("  Available: gromov_delta, hierarchy_separation, drill_down, "
                       "lateral, cross_branch, depth_band, unified_vs_separate, latency, "
-                      "quantization_recall, klein_prefilter, geometric_filters")
+                      "quantization_recall, klein_prefilter, geometric_filters, "
+                      "alpha_vs_klein, tangent_centroid, prune_factor_sweep, "
+                      "curvature_sweep, fusion_comparison, end_to_end")
     else:
         runner.run_all()
 
