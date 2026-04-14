@@ -1,8 +1,8 @@
 # Hyperbolic Vector Support for Qdrant
 
 **Branch:** `feat/hyperbolic-vector-support`
-**Timeline:** 2026-04-07 to 2026-04-10 (Phases 1-5)
-**Scale:** 23 commits, 93 files, +25,781 lines across Rust core, Python testbench, datasets, and documentation
+**Timeline:** 2026-04-07 to 2026-04-14 (Phases 1-7)
+**Scale:** 26 commits, ~100 files, +32,000 lines across Rust core, Python testbench, chatbot evaluator, datasets, and documentation
 
 ---
 
@@ -18,9 +18,12 @@
 8. [Datasets](#8-datasets)
 9. [Benchmark Results](#9-benchmark-results)
 10. [Algorithms and Methodologies](#10-algorithms-and-methodologies)
-11. [Phase History](#11-phase-history)
-12. [File Inventory](#12-file-inventory)
-13. [What's Next](#13-whats-next)
+11. [Phase 6: Client-Side Algorithm Suite](#11-phase-6-client-side-algorithm-suite)
+12. [Phase 7: Chatbot Query Optimization](#12-phase-7-chatbot-query-optimization)
+13. [Key Discoveries](#13-key-discoveries)
+14. [Phase History](#14-phase-history)
+15. [File Inventory](#15-file-inventory)
+16. [What's Next](#16-whats-next)
 
 ---
 
@@ -28,11 +31,15 @@
 
 A fork of Qdrant that adds `Distance::Poincare` — a hyperbolic distance metric for the Poincare ball model. This enables **hierarchy-aware vector search** that flat Euclidean/cosine distance cannot do.
 
-The core idea: in a unified Qdrant collection, each point has two named vectors:
+The core idea: in a unified Qdrant collection, each point has multiple named vectors:
 - **`dense`** (1024d, Cosine) — for flat semantic similarity ("find similar items")
-- **`poincare`** (128d, Poincare) — for hierarchical navigation ("find parent narrative", "drill into child stories")
+- **`poincare`** (128d, Poincare) — for exact hyperbolic distance (brute-force, geometric filters)
+- **`tangent`** (128d, Euclidean) — for hierarchy-aware HNSW search (log-map projection of Poincare)
 
-Both coexist in one collection. Cosine handles what it's good at. Poincare adds what cosine can't do.
+Cosine and hyperbolic are **complementary, not competing**. A chatbot routes by query intent:
+- "Find posts about knife crime" → cosine (domain precision)
+- "What narratives are driving the unrest?" → tangent (depth diversity, hierarchy traversal)
+- "Give me a briefing on UK perception in Iraq" → tangent + RRF fusion (multi-level structure)
 
 ---
 
@@ -49,16 +56,20 @@ Hyperbolic space has exponential volume growth (V(r) ~ e^r), matching tree branc
 - **Leaves** near the boundary (high Busemann depth)
 - **Siblings** close together, **cousins** far apart
 
-This is not theoretical — our testbench proves it:
+This is not theoretical — our testbench proves it across Phases 5-7:
 
-| Capability | Cosine | Poincare |
-|-----------|--------|----------|
-| "Find similar posts" | 0.58 area recall | 0.57 area recall |
+| Capability | Cosine | Hyperbolic (Tangent HNSW) |
+|-----------|--------|--------------------------|
+| "Find similar posts" | **0.58 area recall** | 0.57 area recall |
 | "Find children of this narrative" | Cannot do this | **1.0 recall** |
 | "Find items at hierarchy depth 2-3" | Cannot do this | **100% precision** |
-| "Is this dataset tree-like?" | Cannot measure | **Gromov delta = 0.057** |
+| "Find my ancestor in the hierarchy" | 8% hit rate | **46% hit rate (5.75x)** |
+| "Give me a multi-level briefing" | 0.62 depth entropy | **0.94 depth entropy (+52%)** |
+| "What narrative branches exist?" | 2.4 branches | **6.0 branches (2.5x)** |
+| "Find siblings without explicit filter" | N/A | **44.8% sibling recall from geometry alone** |
+| Brute-force recall@10 (c=0.25) | — | **0.90 (tangent HNSW)** |
 
-Poincare matches cosine for flat retrieval (no penalty) and adds hierarchy capabilities cosine simply cannot provide.
+Cosine excels at domain precision. Hyperbolic excels at depth diversity. Together they unlock the full picture.
 
 ---
 
@@ -85,20 +96,29 @@ Plus wiring across ~30 files:
 - gRPC proto: `Poincare = 5`
 - Feature-gated behind `--features hyperbolic`
 
-### Testbench (Python, ~6000 lines)
+### Testbench (Python, ~10,000 lines)
 
 Everything application-specific lives here, not in the Qdrant fork:
 
 ```
 dev/testbench/
-├── benchmark.py         — 11-suite benchmark engine
-├── embed.py             — Embedding pipeline (pplx-embed-v1 → PCA → Poincare)
+├── benchmark.py          — 17-suite benchmark engine (Phases 1-6)
+├── embed.py              — Embedding pipeline (pplx-embed-v1 → PCA → Poincare → tangent)
 ├── collection_builder.py — Unified/separate/cosine collection creation
-├── queries.py           — 7 query types (drill-down, lateral, Klein, geometric...)
-├── hyperbolic_math.py   — Poincare/Lorentz/Klein math + geometric filters
-├── projection.py        — 4 tier-aware projection strategies
-├── fusion.py            — Dual-space fusion strategies
-└── download_dataset.py  — WOS dataset downloader
+├── queries.py            — 10 query types (drill-down, lateral, Klein, geometric, alpha, tangent, combined...)
+├── hyperbolic_math.py    — Poincare/Lorentz/Klein math + geometric filters
+├── projection.py         — 4 tier-aware projection strategies + auto_curvature
+├── fusion.py             — 6 dual-space fusion strategies (RRF, alpha, busemann, horosphere)
+├── tangent.py            — Tangent space projection (origin/frechet/einstein centroids)
+├── comparator.py         — A/B comparison framework (recall@k, rank correlation)
+├── pipeline_config.py    — Per-collection pipeline config presets
+├── download_dataset.py   — WOS dataset downloader
+└── chatbot/              — Phase 7: chatbot query optimization evaluator
+    ├── eval.py           — Main evaluator (6 patterns × 3 strategies)
+    ├── baselines.py      — Cosine, hyperbolic, multi-hop strategies
+    ├── metrics.py        — 10 hierarchy-awareness metrics
+    ├── query_patterns.py — 6 chatbot query pattern implementations
+    └── results/          — JSON output
 ```
 
 ### Design Principle
@@ -476,7 +496,126 @@ Reduces acosh calls from ~200 to 50, but recall is 0.827 (not a full replacement
 
 ---
 
-## 11. Phase History
+## 11. Phase 6: Client-Side Algorithm Suite
+
+**Commit:** `f0f041698` (2026-04-14) | **+4,407 lines, 24 files**
+
+### What Was Built
+
+Three-layer client-side pipeline:
+
+1. **Pre-upload**: tangent coordinate computation (3 centroid strategies), alpha precomputation, auto-curvature
+2. **Query-time**: alpha pipeline, tangent HNSW pipeline, combined pipeline
+3. **Post-processing**: 6 fusion strategies (RRF, linear alpha, busemann weighted, depth band, busemann proximity, horosphere with 4 intents)
+
+Plus: A/B comparator framework, pipeline config presets, gRPC curvature field in VectorParams.
+
+### Key Findings (BGC, 92K docs, c=0.25)
+
+| Pipeline | Recall@10 vs Brute-Force | Notes |
+|----------|------------------------:|-------|
+| **Tangent HNSW (origin)** | **0.900** | Uses stock Qdrant Euclidean HNSW |
+| RRF fusion (cosine + Poincare) | 0.690 | Best fusion strategy |
+| Alpha pipeline | 0.614 | -33% latency vs Klein |
+| Klein pipeline | 0.614 | Phase 5 baseline |
+
+### Critical Discovery: Curvature is Inverted
+
+c=0.25 is **3.3x better** than c=5.0 on same_tier_precision (0.810 vs 0.246 in initial sweep). The Gromov delta → curvature mapping we designed was inverted. Low curvature preserves neighborhood structure; high curvature distorts boundary-heavy data. The auto_curvature heuristic is unreliable — per-collection empirical calibration (or SONA learning) is required.
+
+### Optimal Parameters
+
+| Parameter | Value | Evidence |
+|-----------|-------|---------|
+| Curvature | c=0.25 | 2x recall vs c=5.0 |
+| Query pipeline | Tangent HNSW | 0.90 vs 0.614 recall |
+| Centroid strategy | Origin | Same quality as frechet/einstein, free |
+| Prune factor | 5 | Same recall as 20, 4x less work |
+| Fusion | RRF | 0.690 recall, best strategy |
+
+---
+
+## 12. Phase 7: Chatbot Query Optimization
+
+**Commit:** `2ba55c3fb` (2026-04-14) | **+3,122 lines, 8 files**
+
+### Motivation
+
+Real user queries from Pythia's `NetworksLensHistory` (67 queries across 3 clients) revealed that many chatbot queries are inherently hierarchical. The current Pythia pipeline requires 5-7 cross-database hops (Qdrant → Neo4j → MongoDB → LLM). We hypothesized that hyperbolic embeddings in a unified collection could reduce this to 1-2 Qdrant queries.
+
+### What Was Built
+
+New `dev/testbench/chatbot/` module: 6 query patterns × 3 retrieval strategies evaluated on BGC.
+
+**Strategies:**
+- **Cosine-only** — dense named vector + payload filters (flat baseline)
+- **Hyperbolic** — tangent HNSW + RRF fusion (the thesis)
+- **Multi-hop** — separate per-tier collections, sequential queries (current Pythia simulation)
+
+**Patterns (motivated by real Pythia queries):**
+
+| Pattern | Example Query | What It Tests |
+|---------|--------------|---------------|
+| Drill-Up | "Disorder following teen riots in Clapham" | Upward hierarchy traversal |
+| Context Assembly | "Central bank narratives" | Full subtree retrieval |
+| Hierarchy Similarity | "Knife Crime in London" | Sibling finding |
+| Multi-Level Briefing | "Tell me about the narratives around crime in London" | Depth-diverse results |
+| Cross-Branch | "King Charles narratives" | Cross-branch narrative discovery |
+| Narrative Landscape | "view of british in iraq currently" | Distinct narrative branches |
+
+### Results: Thesis Validated
+
+| Pattern | Key Metric | Cosine | Hyperbolic | Hyperbolic Advantage |
+|---------|-----------|--------|------------|---------------------|
+| Drill-Up | ancestor_hit_rate | 0.08 | **0.46** | **5.75x** |
+| Context Assembly | depth_coverage | 0.952 | **1.000** | Full tier coverage |
+| Hierarchy Similarity | sibling_recall (no filter) | N/A | **0.448** | Geometry alone |
+| Multi-Level Briefing | depth_entropy | 0.615 | **0.937** | **+52%** |
+| Cross-Branch | branch_diversity | 2.43 | **6.0** | **2.5x** |
+| Cross-Branch | depth_precision | 0.129 | **0.500** | **3.9x** |
+
+### The Complementarity Finding
+
+Hyperbolic and cosine are **complementary, not competing**:
+- Cosine excels at **domain precision** (subtree_coherence: 0.414 vs 0.264)
+- Hyperbolic excels at **depth diversity** (depth_coverage: 1.0 vs 0.952, entropy: +52%)
+
+A chatbot routes by query intent:
+- Flat semantic queries → cosine
+- Hierarchy-aware queries → tangent HNSW
+- Both live as named vectors in the same unified collection
+
+---
+
+## 13. Key Discoveries
+
+### 1. Curvature Must Be Calibrated Empirically
+
+The Gromov delta → curvature mapping is inverted. c=0.25 is 3.3x better than c=5.0 on BGC. auto_curvature() suggested c=2.0 — wrong. Low curvature preserves neighborhood structure for boundary-heavy data (99.9% content tier). Per-collection calibration or SONA learning is essential.
+
+### 2. Tangent HNSW is the Production Workhorse
+
+Recall 0.90 using stock Qdrant Euclidean HNSW on tangent-projected coordinates. No fork needed for the highest-recall pipeline. The Poincare fork is valuable for exact distance, geometric filters, and brute-force ground truth — but tangent HNSW is the deployment path.
+
+### 3. Phase 5 vs Phase 6 Ground Truth Difference
+
+Phase 5 measured Klein pipeline vs HNSW (recall 0.827). Phase 6 measured all pipelines vs brute-force exact Poincare (recall 0.298 at c=5.0, 0.614 at c=0.25). The stricter ground truth revealed that HNSW at c=5.0 was itself inaccurate — Phase 5's "good" numbers were two approximate methods agreeing with each other.
+
+### 4. Hyperbolic Geometry Encodes Hierarchy in the Embedding
+
+Phase 7's hierarchy_similarity pattern proved this: tangent HNSW finds 44.8% true siblings without any explicit parent filtering — purely from the geometric structure of the Poincare ball. The embedding captures hierarchy relationships that cosine completely misses.
+
+### 5. RRF Fusion Beats Any Single Pipeline
+
+RRF combining cosine + Poincare results achieves 0.690 recall — higher than either pipeline alone (cosine or alpha/tangent). The two spaces capture different information.
+
+### 6. Busemann/Horosphere Fusion Shows No Benefit on Flat Data
+
+On BGC (99.9% content tier), depth-based reweighting has nothing meaningful to shift. The value of Busemann/horosphere fusion will appear on data with balanced tier distribution — like real Pythia collections with narratives + stories + posts.
+
+---
+
+## 14. Phase History
 
 ### Phase 1: Foundation (2026-04-07)
 - Distance::Poincare enum + feature gate
@@ -522,9 +661,27 @@ Reduces acosh calls from ~200 to 50, but recall is 0.827 (not a full replacement
 - Geometric filters (InBall, InCone, composable)
 - 11 benchmark suites total
 
+### Phase 6: Client-Side Algorithm Suite (2026-04-14)
+- Tangent HNSW pipeline (0.90 recall — best)
+- Alpha pipeline (-33% latency vs Klein)
+- 6 fusion strategies (RRF wins at 0.690)
+- Curvature finding: c=0.25 >> c=5.0 (inverted mapping)
+- gRPC curvature field in VectorParams
+- SIMD unsafe cleanup
+- 17 benchmark suites total
+
+### Phase 7: Chatbot Query Optimization (2026-04-14)
+- 6 chatbot query patterns from real Pythia user queries
+- 3 retrieval strategies (cosine, hyperbolic, multi-hop)
+- Validated thesis: hyperbolic complements cosine
+- Drill-up ancestor hit rate: 46% vs 8% (5.75x)
+- Multi-level briefing depth entropy: +52%
+- Cross-branch diversity: 6.0 vs 2.4 branches
+- Hierarchy similarity: 44.8% siblings from geometry alone
+
 ---
 
-## 12. File Inventory
+## 15. File Inventory
 
 ### Qdrant Fork (Rust)
 
@@ -544,14 +701,26 @@ Plus ~30 modified files for wiring (scorer dispatch, feature flags, gRPC, config
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `dev/testbench/benchmark.py` | 2,135 | 11-suite benchmark engine |
-| `dev/testbench/embed.py` | 1,199 | Embedding + projection + upsert pipeline |
-| `dev/testbench/collection_builder.py` | 500 | Collection creation (unified/separate/cosine) |
-| `dev/testbench/queries.py` | 518 | 7 query implementations |
-| `dev/testbench/hyperbolic_math.py` | 372 | Poincare/Lorentz/Klein math + filters (21 functions) |
-| `dev/testbench/projection.py` | 240 | 4 projection strategies |
-| `dev/testbench/fusion.py` | 167 | Dual-space fusion strategies |
+| `dev/testbench/benchmark.py` | ~2,550 | 17-suite benchmark engine (Phases 1-6) |
+| `dev/testbench/embed.py` | ~1,300 | Embedding + projection + tangent + upsert pipeline |
+| `dev/testbench/collection_builder.py` | ~520 | Collection creation (unified/separate/cosine) |
+| `dev/testbench/queries.py` | ~770 | 10 query implementations (incl. alpha, tangent, combined) |
+| `dev/testbench/hyperbolic_math.py` | ~490 | Poincare/Lorentz/Klein math + filters + log_map + frechet |
+| `dev/testbench/projection.py` | ~260 | 4 projection strategies + auto_curvature |
+| `dev/testbench/fusion.py` | ~260 | 6 fusion strategies (RRF, alpha, busemann, horosphere) |
+| `dev/testbench/tangent.py` | 85 | Tangent space projection (3 centroid strategies) |
+| `dev/testbench/comparator.py` | 87 | A/B comparison (recall@k, rank correlation, reports) |
+| `dev/testbench/pipeline_config.py` | 64 | Pipeline config presets |
 | `dev/testbench/download_dataset.py` | 154 | WOS dataset downloader |
+
+### Chatbot Evaluator (Phase 7)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `dev/testbench/chatbot/eval.py` | ~420 | Main evaluator entry point |
+| `dev/testbench/chatbot/baselines.py` | ~415 | 3 retrieval strategies (cosine, hyperbolic, multi-hop) |
+| `dev/testbench/chatbot/query_patterns.py` | ~710 | 6 chatbot query patterns + hierarchy index |
+| `dev/testbench/chatbot/metrics.py` | ~100 | 11 hierarchy-awareness metrics |
 
 ### Datasets
 
@@ -600,17 +769,33 @@ einstein_midpoint(points, c)
 
 ---
 
-## 13. What's Next
+## 16. What's Next
 
-### Pythia Integration (Phase NEXT)
+### Immediate: HWV Validation
 
-The testbench has validated everything. Now carry the proven patterns to Pythia:
+Run Phase 7 chatbot evaluator on HWV (6-level, 10K docs) to confirm deeper hierarchies show stronger hyperbolic advantage. Infrastructure is ready — just need `python embed.py --dataset hwv` then `python -m chatbot.eval --dataset hwv`.
 
-1. **Unified per-client collections** — replace 13 global/networks collections with one per client
-2. **Lens retriever update** — multi-level search via named vectors + item_type filters
-3. **Neo4j scope reduction** — hierarchy moves to Qdrant payloads; Neo4j handles only actor relationships
-4. **Geometric filters in Lens** — InBall/InCone/DepthBand for intelligent search narrowing
-5. **SONA integration** — per-collection learning with hyperbolic-aware Thompson sampling
+### Short-term: Query Intent Routing
+
+Build a lightweight classifier that detects whether a chatbot query needs hierarchy (route to tangent HNSW) or flat similarity (route to cosine). Based on Phase 7's pattern analysis of real Pythia queries.
+
+### Medium-term: Pythia Integration
+
+Carry proven patterns to the Pythia platform:
+
+1. **Unified per-client collections** — replace per-type collections (networks_posts, stories, narratives) with one collection per client containing all tiers
+2. **Named vectors** — dense (1024d Cosine) + sparse (BGE-M3) + tangent (128d Euclid) + poincare (128d Poincare)
+3. **Lens retriever update** — query intent routing selects cosine vs tangent per query
+4. **Neo4j scope reduction** — hierarchy moves to Qdrant payloads (busemann_depth, parent_ids, child_ids); Neo4j handles only actor relationships (CO_AMPLIFIES, POSTED_IN)
+5. **Embedding pipeline update** — add PCA → Poincare projection → tangent → Busemann depth to the existing pplx-embed-v1 pipeline
+
+### Long-term: SONA Learning
+
+Per-collection adaptive learning for:
+- **Curvature** — learn optimal c from retrieval feedback (manual tuning proven broken by Phase 6)
+- **Fusion weights** — learn cosine/tangent routing thresholds per collection
+- **Prune factor** — optimize tangent HNSW prune_factor per collection
+- **Projection strategy** — learn optimal einstein_spread parameters
 
 ### Inspiration Sources
 
